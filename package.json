@@ -1,6 +1,9 @@
 {
   "name": "tfunds-bot",
   "version": "2.0.0",
+  "engines": {
+    "node": "18.x"
+  },
   "dependencies": {
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
