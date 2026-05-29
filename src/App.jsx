@@ -1196,7 +1196,7 @@ export default function App() {
         }, 500);
       }
     } catch(e){ addLog("Account","Balance fetch failed: "+e.message,"error"); }
-  },[creds,isDemo,addLog]);
+  },[creds,isDemo,paperMode,addLog]);
 
   /* ── Pair eligibility filter — re-run whenever amount or instrument info changes ── */
   /* ── Pair eligibility filter — just keeps exchange-supported pairs ── */
