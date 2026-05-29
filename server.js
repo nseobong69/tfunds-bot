@@ -1,14 +1,14 @@
 const express = require("express");
 const cors = require("cors");
 const fetch = require("node-fetch");
+const path = require("path");
 
 const app = express();
 
-// Allow any browser to call this proxy (needed since it's public)
 app.use(cors());
 app.use(express.json());
 
-// ── Simple rate limiter: max 60 requests per IP per minute ──
+// ── Rate limiter: max 60 requests per IP per minute ──
 const hits = new Map();
 app.use((req, res, next) => {
   const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
@@ -69,6 +69,12 @@ app.all("/proxy/:exchange/*", async (req, res) => {
 });
 
 app.get("/health", (_, res) => res.json({ ok: true }));
+
+// ── Serve React app ──
+app.use(express.static(path.join(__dirname, "build")));
+app.get("*", (req, res) => {
+  res.sendFile(path.join(__dirname, "build", "index.html"));
+});
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
