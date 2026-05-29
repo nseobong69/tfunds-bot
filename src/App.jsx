@@ -1032,7 +1032,31 @@ export default function App() {
   const [trades,     setTrades]     = useState([]);
   const [openPos,    setOpenPos]    = useState([]);
   const [log,        setLog]        = useState([]);
-  const [tab,        setTab]        = useState("dashboard");
+  const [tab, setTabRaw] = useState(()=>{
+    // Restore last tab from sessionStorage on refresh
+    return sessionStorage.getItem("tfunds_tab") || "dashboard";
+  });
+
+  // Wrapper so every tab change also updates sessionStorage + browser history
+  const setTab = useCallback((newTab) => {
+    sessionStorage.setItem("tfunds_tab", newTab);
+    // Push a new history entry so the browser back button works
+    window.history.pushState({ tab: newTab }, "", window.location.pathname);
+    setTabRaw(newTab);
+  }, []);
+
+  // Listen for browser back/forward button
+  useEffect(()=>{
+    const onPop = (e) => {
+      const t = e.state?.tab || "dashboard";
+      sessionStorage.setItem("tfunds_tab", t);
+      setTabRaw(t);
+    };
+    window.addEventListener("popstate", onPop);
+    // Push initial history entry so the very first back press works
+    window.history.replaceState({ tab: tab }, "", window.location.pathname);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
   const [cfg,        setCfg]        = useState({
     pairs:     TOP_PAIRS,
     amount:    "50",
@@ -1042,6 +1066,7 @@ export default function App() {
     minConfidence: "62",
     useAtrSl:  true,     // use ATR-based SL/TP when available
     trailingPct: "1.5",  // trailing stop % (0 = disabled)
+    maxPositions: "3",   // max concurrent open positions — prevents balance drain
   });
 
   /* ── Wallet state ── */
@@ -1059,6 +1084,7 @@ export default function App() {
 
   const logRef      = useRef(null);
   const botRef      = useRef(null);
+  const botRunningRef = useRef(false); // mirrors botRunning state — readable inside async callbacks
   const priceRef    = useRef({});
   const posRef      = useRef([]);
   const balancesRef = useRef([]);   // always-current balances for use inside callbacks
@@ -1090,6 +1116,7 @@ export default function App() {
 
   useEffect(()=>{ posRef.current=openPos; },[openPos]);
   useEffect(()=>{ balancesRef.current=balances; },[balances]);
+  useEffect(()=>{ botRunningRef.current=botRunning; },[botRunning]);
   useEffect(()=>{ if(logRef.current) logRef.current.scrollTop=logRef.current.scrollHeight; },[log]);
   // Reset symbol cache whenever the connected exchange changes
   useEffect(()=>{ validSymbolsRef.current = null; instrInfoRef.current = {}; instrInfoLoadedRef.current = false; },[creds]);
@@ -1790,8 +1817,88 @@ Respond in JSON only: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","short_reason":"ma
     }
   },[paperMode,isDemo,creds,addLog,fetchBalances]);
 
+  /* ── Sell ALL non-USDT coins on Bybit (used on STOP for live mode) ──
+     Queries the actual Bybit wallet instead of relying on posRef, which may
+     be empty after a page refresh or if state drifted from the exchange.  */
+  const sellAllLivePositions = useCallback(async () => {
+    if (paperMode || isDemo || !creds) return { sold: 0, failed: 0 };
+    const { exchange: ex, apiKey: k, apiSecret: s } = creds;
+    if (ex !== "bybit") {
+      // Non-Bybit: use posRef snapshot (caller handles this)
+      return null;
+    }
+    addLog("Bot", "Querying live Bybit wallet to sell all positions…", "info");
+    let sold = 0, failed = 0;
+    // Check BOTH account types and collect all sellable coins — don't stop at empty UNIFIED
+    // because coins may live in SPOT even when UNIFIED is empty (depends on account setup)
+    const allSellable = [];
+    for (const accountType of ["UNIFIED", "SPOT"]) {
+      try {
+        const walletData = await bbSign(k, s, "/v5/account/wallet-balance", { accountType });
+        const coins = walletData.list?.[0]?.coin || [];
+        const sellable = coins.filter(c => {
+          if (["USDT","USDC","BUSD"].includes(c.coin)) return false;
+          // Use the highest available qty: availableToWithdraw > availableToTrade > walletBalance
+          const qty = Math.max(
+            parseFloat(c.availableToWithdraw || "0"),
+            parseFloat(c.availableToTrade    || "0"),
+            parseFloat(c.walletBalance        || "0")
+          );
+          return qty > 0;
+        }).map(c => ({
+          coin: c.coin,
+          qty: Math.max(
+            parseFloat(c.availableToWithdraw || "0"),
+            parseFloat(c.availableToTrade    || "0"),
+            parseFloat(c.walletBalance        || "0")
+          ),
+          accountType,
+        }));
+        if (sellable.length > 0) {
+          addLog("Bot", `Found ${sellable.length} coin(s) in ${accountType} wallet to sell`, "info");
+          allSellable.push(...sellable);
+        } else {
+          addLog("Bot", `No non-USDT coins in ${accountType} wallet`, "info");
+        }
+      } catch (e) {
+        addLog("Bot", `Wallet fetch failed (${accountType}): ${e.message}`, "warn");
+      }
+    }
+    // Deduplicate by coin (same coin shouldn't appear in both account types, but just in case)
+    const seen = new Set();
+    const uniqueSellable = allSellable.filter(c => {
+      if (seen.has(c.coin)) return false;
+      seen.add(c.coin);
+      return true;
+    });
+    if (uniqueSellable.length === 0) {
+      addLog("Bot", "No sellable coins found in any Bybit wallet — all positions may already be closed", "info");
+    } else {
+      addLog("Bot", `Selling ${uniqueSellable.length} coin(s) → USDT`, "info");
+      for (const coin of uniqueSellable) {
+        const sym = coin.coin + "USDT";
+        addLog("Bot", `Selling ${coin.qty.toFixed(6)} ${coin.coin} (${coin.accountType})…`, "info");
+        const result = await placeOrder(sym, "SELL", coin.qty);
+        if (result) {
+          sold++;
+          addLog("Bot", `✓ ${coin.coin} sold → USDT`, "ok");
+        } else {
+          failed++;
+          addLog("Bot", `⚠ Could not sell ${coin.coin} — below min or no USDT pair — check Bybit app`, "warn");
+        }
+      }
+    }
+    // Refresh balance: immediate + 3 s + 8 s so USDT shows up
+    fetchBalances();
+    setTimeout(() => fetchBalances(), 3000);
+    setTimeout(() => fetchBalances(), 8000);
+    return { sold, failed };
+  }, [paperMode, isDemo, creds, addLog, placeOrder, fetchBalances]);
+
   /* ── Bot tick — TA + Order Book + AI + Funding Rate (fully automatic) ── */
   const runBotTick = useCallback(async()=>{
+    // ── Guard: if bot was stopped mid-tick, abort immediately ──
+    if (!botRunningRef.current) return;
     // ── Auto-fetch funding rates every 8 hours to keep data fresh ──
     const now = Date.now();
     const lastFunding = runBotTick._lastFundingFetch||0;
@@ -1809,7 +1916,15 @@ Respond in JSON only: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","short_reason":"ma
 
     addLog("Scanner",`[${isDemo?"DEMO":"LIVE"}] Scanning batch ${batchPairs.length}/${total} pairs (offset ${batchStart}) · Min conf ${cfg.minConfidence}%`,"info");
 
+    // ── Gate: don't open more positions than the configured maximum ──
+    const maxPos = parseInt(cfg.maxPositions || "3");
+    if (posRef.current.length >= maxPos) {
+      addLog("Scanner",`Max positions (${maxPos}) reached — waiting for exits before opening new trades`,"warn");
+      return;
+    }
+
     let holdCount = 0;
+    let openedThisTick = 0; // only open 1 new position per tick to prevent balance drain
     for (const symbol of batchPairs) {
       if (!isDemo && validSymbolsRef.current && !validSymbolsRef.current.has(symbol)) continue;
       const price=priceRef.current[symbol];
@@ -1935,13 +2050,26 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
 
       /* Open new position */
       if (!existing||(existing&&existing.side!==sig.action)) {
-        const usdtBal = parseFloat(balancesRef.current.find(b=>b.asset==="USDT")?.free||"0");
-        const requestedAmt = parseFloat(cfg.amount)||1;
-        const safeAmt = Math.min(requestedAmt, usdtBal * 0.98);
-        if (safeAmt < 0.1) {
-          addLog("Bot",`Skipping ${symbol} — insufficient USDT balance ($${usdtBal.toFixed(4)} available)`,"warn");
+        // ── Hard limit: 1 new position per tick, spread across scans ──
+        if (openedThisTick >= 1) {
+          addLog("Bot",`${symbol} signal skipped — already opened 1 position this tick (protects balance)`,"info");
           continue;
         }
+        // ── Stop guard: don't open if bot was stopped while this tick was running ──
+        if (!botRunningRef.current) {
+          addLog("Bot","Bot stopped — cancelling pending trade opens","warn");
+          break;
+        }
+        const usdtBal = parseFloat(balancesRef.current.find(b=>b.asset==="USDT")?.free||"0");
+        const requestedAmt = parseFloat(cfg.amount)||1;
+        // Use exactly the requested amount per trade — do NOT cap to total balance.
+        // This ensures $5 means $5 per coin, not $5 spread across all balance.
+        // Only fall back to available balance if it's actually less than requested.
+        if (usdtBal * 0.98 < requestedAmt) {
+          addLog("Bot",`Skipping ${symbol} — insufficient USDT balance ($${usdtBal.toFixed(4)} available, need $${requestedAmt})`,"warn");
+          continue;
+        }
+        const safeAmt = requestedAmt;
         const orderQty = +(safeAmt/price).toFixed(6);
         const TAKER_FEE = 0.001;
         const qty = +(orderQty * (1 - TAKER_FEE)).toFixed(6);
@@ -1954,12 +2082,19 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
         // ── Optimistic balance deduction — prevents same-tick "insufficient balance" ──
         // balancesRef won't update for ~3s after order. Deduct now so the next symbol
         // in this batch doesn't try to spend money that's already gone.
-        if (!paperMode && !isDemo) {
-          balancesRef.current = balancesRef.current.map(b =>
+        // Applied for ALL modes (paper/demo/live) so $5 per coin doesn't get spent multiple times.
+        balancesRef.current = balancesRef.current.map(b =>
+          b.asset === "USDT"
+            ? { ...b, free: String(Math.max(0, parseFloat(b.free) - safeAmt).toFixed(4)) }
+            : b
+        );
+        if (paperMode || isDemo) {
+          // Also update React state so UI balance reflects the deduction
+          setBalances(prev => prev.map(b =>
             b.asset === "USDT"
               ? { ...b, free: String(Math.max(0, parseFloat(b.free) - safeAmt).toFixed(4)) }
               : b
-          );
+          ));
         }
         const pos={
           id:Date.now()+Math.random(), symbol, side:sig.action, entry:price, qty,
@@ -1969,6 +2104,7 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
           openTs:new Date(), rsi:sig.meta?.rsi, macd:sig.meta?.macd, bookBias,
         };
         setOpenPos(prev=>[...prev.filter(p=>p.symbol!==symbol),pos]);
+        openedThisTick++;
         addLog("Bot",
           `Opened ${sig.action==="BUY"?"LONG":"SHORT"} ${symbol} | Conf:${sig.confidence}% | Book:${bookBias>0?"+":""}${bookBias.toFixed(0)}% | ${sig.reasons[0]} | SL:${slPct.toFixed(2)}% TP:${tpPct.toFixed(2)}%`,
           "signal"
@@ -3116,6 +3252,7 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
               <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,marginBottom:20}}>
                 {[
                   ["AMOUNT PER TRADE (USDT)","amount","50"],
+                  ["MAX OPEN POSITIONS","maxPositions","3"],
                   ["FALLBACK STOP LOSS %","stopLoss","2"],
                   ["FALLBACK TAKE PROFIT %","takeProfit","4"],
                   ["MIN. SIGNAL CONFIDENCE %","minConfidence","62"],
@@ -3969,6 +4106,7 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
 
               {/* ── OPTION 1: Stop and add profit to balance (ALL modes) ── */}
               <button onClick={async ()=>{
+                setBotRunning(false); // stop the bot tick immediately
                 const currentPrices = priceRef.current;
                 let totalDollarPnl = 0;
                 let totalCapitalReturned = 0;
@@ -3984,10 +4122,12 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
                   closedNow.push({...pos,closePrice:price,pnl:pnlPct,closeTs:new Date(),result:"STOPPED"});
                   addLog("Bot",`Force-closed ${pos.symbol} on STOP — PnL: ${fmtP(pnlPct)}`,pnlPct>=0?"ok":"warn");
                 });
-                if (closedNow.length>0) {
-                  setTrades(prev=>[...closedNow,...prev.slice(0,199)]);
-                  setOpenPos([]);
-                  if (isDemo||paperMode) {
+
+                if (isDemo||paperMode) {
+                  // Paper/demo: update UI immediately
+                  if (closedNow.length>0) {
+                    setTrades(prev=>[...closedNow,...prev.slice(0,199)]);
+                    setOpenPos([]);
                     setBalances(prev=>prev.map(b=>
                       b.asset==="USDT"
                         ?{...b,free:String((parseFloat(b.free)+totalCapitalReturned+totalDollarPnl).toFixed(2))}
@@ -3996,26 +4136,36 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
                     addLog("Bot",
                       `All ${closedNow.length} position${closedNow.length!==1?"s":""} closed — Net P&L: ${totalDollarPnl>=0?"+":""}$${totalDollarPnl.toFixed(2)} added to balance`,
                       totalDollarPnl>=0?"ok":"warn");
+                  }
+                } else {
+                  // Live — ALWAYS sell from actual Bybit wallet first (reliable even after refresh)
+                  addLog("Bot",`Stopping bot — selling all positions on ${(creds?.exchange||"").toUpperCase()}…`,"info");
+                  const sellResult = await sellAllLivePositions();
+                  if (sellResult) {
+                    // Bybit: sellAllLivePositions queried wallet directly — most reliable path
+                    addLog("Bot",
+                      `${sellResult.sold} position${sellResult.sold!==1?"s":""} sold → USDT${sellResult.failed>0?` · ${sellResult.failed} failed (check exchange app)`:""}`,
+                      sellResult.failed===0?"ok":"warn");
                   } else {
-                    // Live — await every sell order sequentially, then re-fetch balance.
-                    addLog("Bot",`Placing ${closedNow.length} sell order${closedNow.length!==1?"s":""}…`,"info");
+                    // Non-Bybit: fall back to posRef loop
                     let sellSuccessCount1 = 0;
                     for (const pos of closedNow) {
                       const closeSide = pos.side==="BUY"?"SELL":"BUY";
                       const result = await placeOrder(pos.symbol,closeSide,pos.qty);
                       if (result) { sellSuccessCount1++; }
-                      else { addLog("Bot",`⚠ Sell failed for ${pos.symbol} — check Bybit manually`,"error"); }
+                      else { addLog("Bot",`⚠ Sell failed for ${pos.symbol} — check exchange manually`,"error"); }
                     }
-                    // Triple-refresh: immediate + 3 s + 8 s so USDT balance updates in the bot
                     fetchBalances();
                     setTimeout(()=>fetchBalances(), 3000);
                     setTimeout(()=>fetchBalances(), 8000);
                     addLog("Bot",
-                      `${sellSuccessCount1}/${closedNow.length} position${closedNow.length!==1?"s":""} sold — Net P&L: ${totalDollarPnl>=0?"+":""}$${totalDollarPnl.toFixed(2)} — USDT refreshing`,
+                      `${sellSuccessCount1}/${closedNow.length} position${closedNow.length!==1?"s":""} sold — USDT refreshing`,
                       sellSuccessCount1===closedNow.length?"ok":"warn");
                   }
+                  // Clear UI after sell attempt
+                  if (closedNow.length>0) setTrades(prev=>[...closedNow,...prev.slice(0,199)]);
+                  setOpenPos([]);
                 }
-                setBotRunning(false);
                 setShowStopModal(false);
                 setTab("dashboard");  // stay on dashboard — balance refreshes in place
               }} style={{padding:"14px 18px",fontFamily:"Orbitron",fontWeight:700,fontSize:10,
@@ -4033,6 +4183,7 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
 
               {/* ── OPTION 2: Stop and withdraw profit (ALL modes) ── */}
               <button onClick={async ()=>{
+                setBotRunning(false); // stop the bot tick immediately
                 if (isDemo||paperMode) {
                   // Demo/paper: credit balance then open wallet
                   const currentPrices = priceRef.current;
@@ -4059,34 +4210,34 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
                     addLog("Bot",`Positions closed — P&L credited. Opening wallet panel.`,"ok");
                   }
                 } else {
-                  // Live — place real sell orders for every open position, then open wallet
-                  const posSnapshot = [...posRef.current];
-                  if (posSnapshot.length > 0) {
-                    const currentPrices = priceRef.current;
+                  // Live — sell from actual Bybit wallet FIRST, then clear UI
+                  addLog("Bot",`Stopping bot — selling all positions on ${(creds?.exchange||"").toUpperCase()}…`,"info");
+                  const sellResult2 = await sellAllLivePositions();
+                  if (sellResult2) {
+                    addLog("Bot",
+                      `${sellResult2.sold} position${sellResult2.sold!==1?"s":""} sold → USDT${sellResult2.failed>0?` · ${sellResult2.failed} failed (check exchange app)`:""}. Opening wallet.`,
+                      sellResult2.failed===0?"ok":"warn");
+                  } else {
+                    // Non-Bybit: fall back to posRef loop
+                    const posSnapshot = [...posRef.current];
                     const closedNow = [];
-                    addLog("Bot",`Placing ${posSnapshot.length} sell order${posSnapshot.length!==1?"s":""}…`,"info");
-                    let sellSuccessCount2 = 0;
                     for (const pos of posSnapshot) {
-                      const price = currentPrices[pos.symbol]||pos.entry;
+                      const price = priceRef.current[pos.symbol]||pos.entry;
                       const pnlPct = pos.side==="BUY"
                         ?(price-pos.entry)/pos.entry*100
                         :(pos.entry-price)/pos.entry*100;
                       closedNow.push({...pos,closePrice:price,pnl:pnlPct,closeTs:new Date(),result:"STOPPED"});
                       addLog("Bot",`Force-closed ${pos.symbol} on STOP — PnL: ${fmtP(pnlPct)}`,pnlPct>=0?"ok":"warn");
                       const result = await placeOrder(pos.symbol,pos.side==="BUY"?"SELL":"BUY",pos.qty);
-                      if (result) { sellSuccessCount2++; }
-                      else { addLog("Bot",`⚠ Sell failed for ${pos.symbol} — check Bybit manually`,"error"); }
+                      if (!result) addLog("Bot",`⚠ Sell failed for ${pos.symbol} — check exchange manually`,"error");
                     }
-                    setTrades(prev=>[...closedNow,...prev.slice(0,199)]);
-                    setOpenPos([]);
-                    // Triple-refresh: immediate + 3 s + 8 s so USDT balance updates in the bot
+                    if (closedNow.length > 0) setTrades(prev=>[...closedNow,...prev.slice(0,199)]);
                     fetchBalances();
                     setTimeout(()=>fetchBalances(), 3000);
                     setTimeout(()=>fetchBalances(), 8000);
-                    addLog("Bot",`${sellSuccessCount2}/${posSnapshot.length} position${posSnapshot.length!==1?"s":""} sold — USDT balance refreshing. Opening wallet.`,sellSuccessCount2===posSnapshot.length?"ok":"warn");
                   }
+                  setOpenPos([]);
                 }
-                setBotRunning(false);
                 setShowStopModal(false);
                 setTab("wallet");
               }} style={{padding:"14px 18px",fontFamily:"Orbitron",fontWeight:700,fontSize:10,
@@ -4104,41 +4255,48 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
 
               {/* ── OPTION 3: Stop trading only — closes positions, no balance credit action ── */}
               <button onClick={async ()=>{
-                const currentPrices = priceRef.current;
-                let totalDollarPnl = 0;
-                const closedNow = [];
-                // Take a snapshot — posRef.current is mutated as we call setOpenPos later
+                setBotRunning(false); // stop the bot tick immediately
                 const posSnapshot = [...posRef.current];
-                for (const pos of posSnapshot) {
-                  const price = currentPrices[pos.symbol] || pos.entry;
-                  const pnlPct = pos.side === "BUY"
-                    ? (price - pos.entry) / pos.entry * 100
-                    : (pos.entry - price) / pos.entry * 100;
-                  totalDollarPnl += (pnlPct / 100) * (pos.qty * pos.entry);
-                  closedNow.push({...pos, closePrice:price, pnl:pnlPct, closeTs:new Date(), result:"STOPPED"});
-                  // Await each sell — fire-and-forget was silently dropping orders
-                  const result = await placeOrder(pos.symbol, pos.side==="BUY"?"SELL":"BUY", pos.qty);
-                  if (result) {
-                    addLog("Bot", `Force-closed ${pos.symbol} on STOP — PnL: ${fmtP(pnlPct)}`, pnlPct>=0?"ok":"warn");
-                  } else {
-                    addLog("Bot", `⚠ Sell FAILED for ${pos.symbol} — check Bybit app manually`, "error");
+                const closedNow3 = [];
+                let totalDollarPnl3 = 0;
+
+                if (paperMode || isDemo) {
+                  // Paper/demo: close from posRef
+                  for (const pos of posSnapshot) {
+                    const price = priceRef.current[pos.symbol] || pos.entry;
+                    const pnlPct = pos.side==="BUY"?(price-pos.entry)/pos.entry*100:(pos.entry-price)/pos.entry*100;
+                    totalDollarPnl3 += (pnlPct/100)*(pos.qty*pos.entry);
+                    closedNow3.push({...pos,closePrice:price,pnl:pnlPct,closeTs:new Date(),result:"STOPPED"});
+                    addLog("Bot",`Force-closed ${pos.symbol} on STOP — PnL: ${fmtP(pnlPct)}`,pnlPct>=0?"ok":"warn");
                   }
-                }
-                if (closedNow.length > 0) {
-                  setTrades(prev => [...closedNow, ...prev.slice(0, 199)]);
-                  setOpenPos([]);
-                  const soldCount = closedNow.length;
-                  addLog("Bot",
-                    `${soldCount} position${soldCount!==1?"s":""} processed — Net P&L: ${totalDollarPnl>=0?"+":""}$${totalDollarPnl.toFixed(2)}`,
-                    totalDollarPnl>=0?"ok":"warn");
-                  // Live: triple-refresh — immediate + 3 s + 8 s so USDT shows up in bot wallet
-                  if (!paperMode && !isDemo) {
+                } else {
+                  // Live — sell from actual Bybit wallet FIRST (bypasses stale posRef)
+                  addLog("Bot",`Stopping bot — selling all positions on ${(creds?.exchange||"").toUpperCase()}…`,"info");
+                  const sellResult3 = await sellAllLivePositions();
+                  if (sellResult3) {
+                    addLog("Bot",
+                      `${sellResult3.sold} position${sellResult3.sold!==1?"s":""} sold → USDT${sellResult3.failed>0?` · ${sellResult3.failed} failed (check exchange app)`:""}`,
+                      sellResult3.failed===0?"ok":"warn");
+                  } else {
+                    // Non-Bybit: fall back to posRef loop
+                    for (const pos of posSnapshot) {
+                      const price = priceRef.current[pos.symbol]||pos.entry;
+                      const pnlPct = pos.side==="BUY"?(price-pos.entry)/pos.entry*100:(pos.entry-price)/pos.entry*100;
+                      totalDollarPnl3 += (pnlPct/100)*(pos.qty*pos.entry);
+                      closedNow3.push({...pos,closePrice:price,pnl:pnlPct,closeTs:new Date(),result:"STOPPED"});
+                      const result = await placeOrder(pos.symbol,pos.side==="BUY"?"SELL":"BUY",pos.qty);
+                      if (result) { addLog("Bot",`✓ Closed ${pos.symbol} — PnL: ${fmtP(pnlPct)}`,pnlPct>=0?"ok":"warn"); }
+                      else { addLog("Bot",`⚠ Sell FAILED for ${pos.symbol} — check exchange app`,"error"); }
+                    }
                     fetchBalances();
                     setTimeout(()=>fetchBalances(), 3000);
                     setTimeout(()=>fetchBalances(), 8000);
                   }
                 }
-                setBotRunning(false);
+                if (closedNow3.length > 0) {
+                  setTrades(prev=>[...closedNow3,...prev.slice(0,199)]);
+                }
+                setOpenPos([]);
                 setShowStopModal(false);
                 setTab("dashboard");  // stay on dashboard — balance refreshes in place
               }} style={{padding:"14px 18px",fontFamily:"Orbitron",fontWeight:700,fontSize:10,
