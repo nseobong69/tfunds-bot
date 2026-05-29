@@ -1032,30 +1032,43 @@ export default function App() {
   const [trades,     setTrades]     = useState([]);
   const [openPos,    setOpenPos]    = useState([]);
   const [log,        setLog]        = useState([]);
-  const [tab, setTabRaw] = useState(()=>{
-    // Restore last tab from sessionStorage on refresh
-    return sessionStorage.getItem("tfunds_tab") || "dashboard";
-  });
+  // ── Tab navigation — uses URL hash + localStorage so both refresh and back button work ──
+  // Hash (#dashboard, #wallet, etc.) survives page refresh and triggers hashchange/popstate.
+  // localStorage also persists the tab in case hash is stripped by the browser.
+  const getInitialTab = () => {
+    const hash = window.location.hash.replace("#", "");
+    const validTabs = ["dashboard","scanner","positions","trades","backtest","wallet","log"];
+    if (validTabs.includes(hash)) return hash;
+    const stored = localStorage.getItem("tfunds_tab");
+    if (stored && validTabs.includes(stored)) return stored;
+    return "dashboard";
+  };
 
-  // Wrapper so every tab change also updates sessionStorage + browser history
+  const [tab, setTabRaw] = useState(getInitialTab);
+
   const setTab = useCallback((newTab) => {
-    sessionStorage.setItem("tfunds_tab", newTab);
-    // Push a new history entry so the browser back button works
-    window.history.pushState({ tab: newTab }, "", window.location.pathname);
+    // Update hash — this automatically creates a browser history entry
+    // so the back button navigates between tabs without any extra pushState calls.
+    window.location.hash = newTab;
+    localStorage.setItem("tfunds_tab", newTab);
     setTabRaw(newTab);
   }, []);
 
-  // Listen for browser back/forward button
+  // Listen for hash changes (back/forward button, or direct hash navigation)
   useEffect(()=>{
-    const onPop = (e) => {
-      const t = e.state?.tab || "dashboard";
-      sessionStorage.setItem("tfunds_tab", t);
+    const onHashChange = () => {
+      const hash = window.location.hash.replace("#", "");
+      const validTabs = ["dashboard","scanner","positions","trades","backtest","wallet","log"];
+      const t = validTabs.includes(hash) ? hash : "dashboard";
+      localStorage.setItem("tfunds_tab", t);
       setTabRaw(t);
     };
-    window.addEventListener("popstate", onPop);
-    // Push initial history entry so the very first back press works
-    window.history.replaceState({ tab: tab }, "", window.location.pathname);
-    return () => window.removeEventListener("popstate", onPop);
+    window.addEventListener("hashchange", onHashChange);
+    // Set initial hash if missing so back button has somewhere to go
+    if (!window.location.hash) {
+      window.location.hash = tab;
+    }
+    return () => window.removeEventListener("hashchange", onHashChange);
   }, []); // eslint-disable-line
   const [cfg,        setCfg]        = useState({
     pairs:     TOP_PAIRS,
@@ -1066,7 +1079,9 @@ export default function App() {
     minConfidence: "62",
     useAtrSl:  true,     // use ATR-based SL/TP when available
     trailingPct: "1.5",  // trailing stop % (0 = disabled)
-    maxPositions: "3",   // max concurrent open positions — prevents balance drain
+    maxPositions: "5",   // max concurrent open positions = numCoins
+    totalBudget:  "10",  // total USDT to allocate across all coins
+    numCoins:     "5",   // how many coins to spread budget across
   });
 
   /* ── Wallet state ── */
@@ -1078,13 +1093,17 @@ export default function App() {
   const [showWcModal,   setShowWcModal]   = useState(false); // WC picker modal
   const [showStopModal, setShowStopModal] = useState(false); // Stop trading summary modal
   const [showStartModal,setShowStartModal]= useState(false); // Live start confirmation modal
-  const [liveTradeAmt,  setLiveTradeAmt]  = useState("");    // Amount entered at START
+  const [liveTradeAmt,  setLiveTradeAmt]  = useState("");    // per-coin amount (auto-computed)
+  const [liveTotalBudget,setLiveTotalBudget]=useState("10");  // total USDT to spend this session
+  const [liveNumCoins,  setLiveNumCoins]  = useState("5");   // how many coins to spread across
+  const [stopBalance,   setStopBalance]   = useState("");    // stop bot if USDT drops below this
   const [wdForm,        setWdForm]        = useState({ coin:"USDT", network:"BSC", address:"", amount:"" });
   const [wdStatus,      setWdStatus]      = useState(null);  // { type, msg }
 
   const logRef      = useRef(null);
   const botRef      = useRef(null);
   const botRunningRef = useRef(false); // mirrors botRunning state — readable inside async callbacks
+  const stopBalanceRef = useRef(0);     // mirrors stopBalance — readable inside async callbacks
   const priceRef    = useRef({});
   const posRef      = useRef([]);
   const balancesRef = useRef([]);   // always-current balances for use inside callbacks
@@ -1117,6 +1136,7 @@ export default function App() {
   useEffect(()=>{ posRef.current=openPos; },[openPos]);
   useEffect(()=>{ balancesRef.current=balances; },[balances]);
   useEffect(()=>{ botRunningRef.current=botRunning; },[botRunning]);
+  useEffect(()=>{ stopBalanceRef.current=parseFloat(stopBalance)||0; },[stopBalance]);
   useEffect(()=>{ if(logRef.current) logRef.current.scrollTop=logRef.current.scrollHeight; },[log]);
   // Reset symbol cache whenever the connected exchange changes
   useEffect(()=>{ validSymbolsRef.current = null; instrInfoRef.current = {}; instrInfoLoadedRef.current = false; },[creds]);
@@ -1916,10 +1936,19 @@ Respond in JSON only: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","short_reason":"ma
 
     addLog("Scanner",`[${isDemo?"DEMO":"LIVE"}] Scanning batch ${batchPairs.length}/${total} pairs (offset ${batchStart}) · Min conf ${cfg.minConfidence}%`,"info");
 
-    // ── Gate: don't open more positions than the configured maximum ──
-    const maxPos = parseInt(cfg.maxPositions || "3");
+    // ── Gate: don't open more positions than numCoins (budget slots) ──
+    const maxPos = Math.max(1, parseInt(cfg.numCoins || cfg.maxPositions || "5"));
     if (posRef.current.length >= maxPos) {
-      addLog("Scanner",`Max positions (${maxPos}) reached — waiting for exits before opening new trades`,"warn");
+      addLog("Scanner",`All ${maxPos} coin slots filled — waiting for exits`,"warn");
+      return;
+    }
+
+    // ── Stop-balance gate at tick level ──
+    const tickUsdtBal = parseFloat(balancesRef.current.find(b=>b.asset==="USDT")?.free||"0");
+    const tickStopFloor = stopBalanceRef.current;
+    if (tickStopFloor > 0 && tickUsdtBal <= tickStopFloor) {
+      addLog("Bot",`⛔ STOP BALANCE hit ($${tickUsdtBal.toFixed(2)} ≤ $${tickStopFloor.toFixed(2)}) — bot stopped`,"error");
+      setBotRunning(false);
       return;
     }
 
@@ -2061,15 +2090,34 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
           break;
         }
         const usdtBal = parseFloat(balancesRef.current.find(b=>b.asset==="USDT")?.free||"0");
-        const requestedAmt = parseFloat(cfg.amount)||1;
-        // Use exactly the requested amount per trade — do NOT cap to total balance.
-        // This ensures $5 means $5 per coin, not $5 spread across all balance.
-        // Only fall back to available balance if it's actually less than requested.
-        if (usdtBal * 0.98 < requestedAmt) {
-          addLog("Bot",`Skipping ${symbol} — insufficient USDT balance ($${usdtBal.toFixed(4)} available, need $${requestedAmt})`,"warn");
+
+        // ── Stop-balance guard: halt if USDT dropped below user's safety floor ──
+        const stopFloor = stopBalanceRef.current;
+        if (stopFloor > 0 && usdtBal <= stopFloor) {
+          addLog("Bot",`⛔ STOP BALANCE hit — USDT $${usdtBal.toFixed(2)} ≤ floor $${stopFloor.toFixed(2)} — bot paused`,"error");
+          setBotRunning(false);
+          break;
+        }
+
+        // ── Per-coin amount = totalBudget ÷ numCoins ──
+        // e.g. $10 budget ÷ 5 coins = $2 per coin
+        const totalBudget = parseFloat(cfg.totalBudget)||parseFloat(cfg.amount)||5;
+        const numCoins    = Math.max(1, parseInt(cfg.numCoins)||5);
+        const perCoinAmt  = +(totalBudget / numCoins).toFixed(4);
+
+        // Count how many coin slots are already filled
+        const alreadyOpen = posRef.current.length;
+        if (alreadyOpen >= numCoins) {
+          addLog("Bot",`All ${numCoins} coin slots filled — waiting for exits`,"info");
+          break;
+        }
+
+        // Only skip if balance can't even cover one coin's slot
+        if (usdtBal * 0.98 < perCoinAmt) {
+          addLog("Bot",`Skipping ${symbol} — need $${perCoinAmt.toFixed(2)}/coin, have $${usdtBal.toFixed(2)} USDT`,"warn");
           continue;
         }
-        const safeAmt = requestedAmt;
+        const safeAmt = perCoinAmt;
         const orderQty = +(safeAmt/price).toFixed(6);
         const TAKER_FEE = 0.001;
         const qty = +(orderQty * (1 - TAKER_FEE)).toFixed(6);
@@ -2158,7 +2206,21 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
       if (hitSL||hitTP) {
         delete trailingStops.current[pos.id];
         const closeSide=pos.side==="BUY"?"SELL":"BUY";
-        await placeOrder(pos.symbol,closeSide,pos.qty);
+        // For live Bybit BUY positions: use actual wallet balance, not stored qty.
+        // Exchange deducts a fee on buy so pos.qty is always slightly more than
+        // what actually landed — sending pos.qty causes "insufficient balance" rejection.
+        let sellQty = pos.qty;
+        if (!paperMode && !isDemo && closeSide === "SELL") {
+          const base = pos.symbol.endsWith("USDT") ? pos.symbol.slice(0,-4)
+                     : pos.symbol.endsWith("USDC") ? pos.symbol.slice(0,-4)
+                     : pos.symbol.slice(0,-4);
+          const actualFree = parseFloat(balancesRef.current.find(b=>b.asset===base)?.free||"0");
+          if (actualFree > 0) {
+            sellQty = actualFree; // use real balance — guaranteed to match exchange
+            addLog("Executor",`[sell] ${pos.symbol}: using actual balance ${actualFree.toFixed(6)} instead of stored qty ${pos.qty}`,"info");
+          }
+        }
+        await placeOrder(pos.symbol,closeSide,sellQty);
         const isTrail = trailPct>0 && hitSL && pnlPct>0;
         const result=hitTP?"TP":isTrail?"TRAIL":"SL";
         setTrades(prev=>[{...pos,closePrice:price,pnl:pnlPct,closeTs:new Date(),result},...prev.slice(0,199)]);
@@ -3770,19 +3832,18 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
               ⚠ REAL ORDERS · REAL FUNDS · {(creds?.exchange||"").toUpperCase()}
             </div>
 
-            {/* Trade amount input */}
-            <div style={{marginBottom:16}}>
+            {/* ── TOTAL BUDGET ── */}
+            <div style={{marginBottom:14}}>
               <div style={{fontFamily:"Orbitron",fontSize:8,letterSpacing:2,
-                color:"rgba(0,245,196,.6)",marginBottom:8}}>AMOUNT PER TRADE (USDT)</div>
+                color:"rgba(0,245,196,.6)",marginBottom:6}}>TOTAL BUDGET TO USE (USDT)</div>
               <div style={{display:"flex",alignItems:"center",gap:8}}>
                 <div style={{position:"relative",flex:1}}>
                   <span style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",
                     fontFamily:"Orbitron",fontSize:13,color:"rgba(0,245,196,.5)",pointerEvents:"none"}}>$</span>
-                  <input
-                    type="number" min="0.5" step="0.5" autoFocus
-                    placeholder="1"
-                    value={liveTradeAmt}
-                    onChange={e=>setLiveTradeAmt(e.target.value)}
+                  <input type="number" min="1" step="1" autoFocus
+                    placeholder="10"
+                    value={liveTotalBudget}
+                    onChange={e=>setLiveTotalBudget(e.target.value)}
                     style={{paddingLeft:26,width:"100%",background:"rgba(0,245,196,.05)",
                       border:"1px solid rgba(0,245,196,.3)",color:"#00f5c4",
                       fontFamily:"Orbitron",fontWeight:700,fontSize:16,
@@ -3790,17 +3851,64 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
                   />
                 </div>
               </div>
-              <div style={{display:"flex",gap:6,marginTop:8}}>
-                {["0.5","1","5","10","20","50"].map(v=>(
-                  <button key={v}
-                    onClick={()=>setLiveTradeAmt(v)}
+              <div style={{display:"flex",gap:6,marginTop:6}}>
+                {["5","10","20","50","100"].map(v=>(
+                  <button key={v} onClick={()=>setLiveTotalBudget(v)}
                     style={{fontFamily:"Orbitron",fontSize:8,padding:"4px 8px",cursor:"pointer",
                       borderRadius:3,border:"1px solid rgba(0,245,196,.25)",
-                      background:liveTradeAmt===v?"rgba(0,245,196,.15)":"transparent",
-                      color:liveTradeAmt===v?"#00f5c4":"rgba(0,245,196,.45)"}}>
+                      background:liveTotalBudget===v?"rgba(0,245,196,.15)":"transparent",
+                      color:liveTotalBudget===v?"#00f5c4":"rgba(0,245,196,.45)"}}>
                     ${v}
                   </button>
                 ))}
+              </div>
+            </div>
+
+            {/* ── NUMBER OF COINS ── */}
+            <div style={{marginBottom:14}}>
+              <div style={{fontFamily:"Orbitron",fontSize:8,letterSpacing:2,
+                color:"rgba(0,245,196,.6)",marginBottom:6}}>SPREAD ACROSS HOW MANY COINS</div>
+              <div style={{display:"flex",gap:6}}>
+                {["2","3","4","5","6","8","10"].map(v=>(
+                  <button key={v} onClick={()=>setLiveNumCoins(v)}
+                    style={{fontFamily:"Orbitron",fontSize:9,padding:"7px 10px",cursor:"pointer",
+                      borderRadius:3,border:"1px solid rgba(0,245,196,.25)",flex:1,
+                      background:liveNumCoins===v?"rgba(0,245,196,.15)":"transparent",
+                      color:liveNumCoins===v?"#00f5c4":"rgba(0,245,196,.45)"}}>
+                    {v}
+                  </button>
+                ))}
+              </div>
+              {liveTotalBudget&&liveNumCoins&&(
+                <div style={{marginTop:7,fontFamily:"Orbitron",fontSize:8,color:"rgba(0,245,196,.55)",
+                  background:"rgba(0,245,196,.04)",border:"1px solid rgba(0,245,196,.12)",
+                  borderRadius:3,padding:"6px 10px"}}>
+                  = ${(parseFloat(liveTotalBudget||0)/Math.max(1,parseInt(liveNumCoins||1))).toFixed(2)} per coin
+                </div>
+              )}
+            </div>
+
+            {/* ── STOP BALANCE ── */}
+            <div style={{marginBottom:14}}>
+              <div style={{fontFamily:"Orbitron",fontSize:8,letterSpacing:2,
+                color:"rgba(245,158,11,.7)",marginBottom:6}}>⛔ STOP BALANCE (optional)</div>
+              <div style={{fontSize:8.5,color:"rgba(160,180,210,.45)",marginBottom:6,lineHeight:1.6}}>
+                Bot auto-stops if USDT balance drops to or below this. Protects your remaining funds.
+              </div>
+              <div style={{display:"flex",alignItems:"center",gap:8}}>
+                <div style={{position:"relative",flex:1}}>
+                  <span style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",
+                    fontFamily:"Orbitron",fontSize:13,color:"rgba(245,158,11,.5)",pointerEvents:"none"}}>$</span>
+                  <input type="number" min="0" step="1"
+                    placeholder="e.g. 30  (leave blank = no floor)"
+                    value={stopBalance}
+                    onChange={e=>setStopBalance(e.target.value)}
+                    style={{paddingLeft:26,width:"100%",background:"rgba(245,158,11,.04)",
+                      border:"1px solid rgba(245,158,11,.25)",color:"#f59e0b",
+                      fontFamily:"Orbitron",fontWeight:700,fontSize:13,
+                      padding:"10px 10px 10px 26px",borderRadius:3,outline:"none"}}
+                  />
+                </div>
               </div>
             </div>
 
@@ -3836,21 +3944,29 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
             </div>
 
             <div style={{fontSize:9,color:"rgba(160,180,210,.5)",lineHeight:1.7,marginBottom:18}}>
-              The bot will use this amount per trade signal. Min $0.50. If a pair's exchange minimum
-              is higher than your amount, the bot auto-bumps the order to meet it (uses a bit more per that trade).
-              Trades are skipped only when your USDT balance is too low.
+              Bot uses your total budget divided equally across coins.
+              E.g. $10 budget ÷ 5 coins = $2 per coin. It will never open more than the chosen number
+              of positions at once. Set a stop balance to protect the rest of your funds.
             </div>
 
             <div style={{display:"flex",gap:10}}>
               <button
                 onClick={()=>{
-                  const amt = liveTradeAmt||"5";
-                  setCfg(c=>({...c,amount:amt}));
+                  const budget   = liveTotalBudget||"10";
+                  const nCoins   = liveNumCoins||"5";
+                  const perCoin  = (parseFloat(budget)/Math.max(1,parseInt(nCoins))).toFixed(2);
+                  setCfg(c=>({...c,
+                    totalBudget: budget,
+                    numCoins:    nCoins,
+                    maxPositions:nCoins,
+                    amount:      perCoin,  // keep cfg.amount in sync for display
+                  }));
                   setShowStartModal(false);
                   fetchBalances();
                   fetchLiveOpenOrders();
                   setBotRunning(true);
-                  addLog("System",`▶ Live trading started — $${amt} USDT per trade on ${(creds?.exchange||"").toUpperCase()}`,"ok");
+                  addLog("System",`▶ Live trading started — $${budget} budget ÷ ${nCoins} coins = $${perCoin}/coin on ${(creds?.exchange||"").toUpperCase()}`,"ok");
+                  if (stopBalance) addLog("System",`⛔ Stop balance set at $${stopBalance} USDT`,"warn");
                 }}
                 style={{flex:1,fontFamily:"Orbitron",fontWeight:900,fontSize:11,letterSpacing:2,
                   padding:"13px",border:"2px solid rgba(0,245,196,.7)",
