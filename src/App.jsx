@@ -135,8 +135,9 @@ async function bbSign(apiKey, apiSecret, path, params={}, method="GET", body=nul
   return d.result;
 }
 async function bbPublic(path, params={}) {
+  // Call Bybit directly — Render/cloud IPs are blocked by Bybit for public endpoints (returns 403)
   const qs = new URLSearchParams(params).toString();
-  const res = await fetch(`${BASE_BB}${path}${qs?"?"+qs:""}`);
+  const res = await fetch(`${DIRECT.bybit}${path}${qs?"?"+qs:""}`);
   if (!res.ok) throw new Error(`Bybit pub ${res.status}`);
   const d = await res.json();
   if (d.retCode!==0) throw new Error(`Bybit: ${d.retMsg}`);
@@ -1067,6 +1068,7 @@ export default function App() {
 
   /* ── New feature state ── */
   const trailingStops  = useRef({});          // { [posId]: { highWater, lowWater } }
+  const obCacheRef     = useRef({});          // { [symbol]: {bids,asks,bidVol,askVol,bias,ts} }
   const [btResult,     setBtResult]     = useState(null);
   const [btRunning,    setBtRunning]    = useState(false);
   const [btSymbol,     setBtSymbol]     = useState("BTCUSDT");
@@ -1114,6 +1116,14 @@ export default function App() {
   const fetchBalances = useCallback(async()=>{
     if (isDemo) {
       setBalances([{asset:"USDT",free:"10000.00",locked:"0"},{asset:"BTC",free:"0.05",locked:"0"},{asset:"ETH",free:"0.8",locked:"0"}]);
+      return;
+    }
+    // Paper mode — seed virtual balance if none exists yet, preserve it once set
+    if (paperMode && !creds) {
+      setBalances(prev => {
+        if (prev.find(b=>b.asset==="USDT")) return prev;
+        return [{asset:"USDT",free:"10000.00",locked:"0"},{asset:"BTC",free:"0",locked:"0"}];
+      });
       return;
     }
     if (!creds) return;
@@ -1387,6 +1397,11 @@ export default function App() {
 
   /* ── Fetch Order Book depth ── */
   const fetchOrderBook = useCallback(async(symbol)=>{
+    // 30s staleness cache — avoid hitting API every bot tick for every signal
+    const cached = obCacheRef.current[symbol];
+    if (cached && Date.now() - cached.ts < 30000) {
+      return {bids:cached.bids,asks:cached.asks,bidVol:cached.bidVol,askVol:cached.askVol,bias:cached.bias};
+    }
     const ex = creds?.exchange||"bybit";
     try {
       let bids=[], asks=[];
@@ -1412,7 +1427,9 @@ export default function App() {
       const bidVol=bids.reduce((s,b)=>s+b.qty*b.price,0);
       const askVol=asks.reduce((s,a)=>s+a.qty*a.price,0);
       const bias=bidVol+askVol>0?(bidVol-askVol)/(bidVol+askVol)*100:0;
-      setOrderBookData(prev=>({...prev,[symbol]:{bids,asks,bidVol,askVol,bias,ts:Date.now()}}));
+      const result={bids,asks,bidVol,askVol,bias,ts:Date.now()};
+      obCacheRef.current[symbol]=result;
+      setOrderBookData(prev=>({...prev,[symbol]:result}));
       return {bids,asks,bidVol,askVol,bias};
     } catch(e) {
       return null;
@@ -1426,21 +1443,24 @@ export default function App() {
       let rates=[];
       // Bybit perpetual funding rates (most reliable cross-exchange)
       const ex = creds?.exchange||"bybit";
-      const symbols = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","AVAXUSDT","LINKUSDT","ADAUSDT","DOTUSDT","NEARUSDT"];
-      const results = await Promise.allSettled(symbols.map(async sym=>{
-        try {
-          if (ex==="binance") {
-            const r = await bPublic("/fapi/v1/premiumIndex",{symbol:sym});
-            return {symbol:sym,rate:parseFloat(r.lastFundingRate)*100,nextTime:r.nextFundingTime};
-          } else {
-            // Bybit linear (perpetual) funding — public endpoint
-            const r = await bbPublic("/v5/market/funding/history",{category:"linear",symbol:sym,limit:"1"});
-            const item=r?.list?.[0];
-            return {symbol:sym,rate:parseFloat(item?.fundingRate||0)*100,nextTime:null};
-          }
-        } catch(_){ return {symbol:sym,rate:0,nextTime:null}; }
-      }));
-      rates = results.filter(r=>r.status==="fulfilled").map(r=>r.value);
+      // Single bulk call — avoids 10 simultaneous requests that trigger rate-limit 403
+      const targetSymbols = new Set(["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","AVAXUSDT","LINKUSDT","ADAUSDT","DOTUSDT","NEARUSDT"]);
+      if (ex==="binance") {
+        const data = await bPublic("/fapi/v1/premiumIndex");
+        rates = (Array.isArray(data)?data:[data])
+          .filter(r=>targetSymbols.has(r.symbol))
+          .map(r=>({symbol:r.symbol,rate:parseFloat(r.lastFundingRate)*100,nextTime:r.nextFundingTime}));
+      } else {
+        // Bybit: fundingRate is included in the /v5/market/tickers?category=linear response
+        const r = await bbPublic("/v5/market/tickers",{category:"linear"});
+        rates = (r.list||[])
+          .filter(t=>targetSymbols.has(t.symbol))
+          .map(t=>({
+            symbol:t.symbol,
+            rate:parseFloat(t.fundingRate||0)*100,
+            nextTime:t.nextFundingTime?Number(t.nextFundingTime):null,
+          }));
+      }
       rates.sort((a,b)=>Math.abs(b.rate)-Math.abs(a.rate));
       setFundingRates(rates);
     } catch(e){
@@ -2129,21 +2149,29 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
 
   /* ── Initialization ── */
   useEffect(()=>{
-    if (!creds&&!isDemo) return;
+    if (!creds&&!isDemo&&!paperMode) return;
     addLog("System","TFunds Bot v2 initialized — 8-indicator TA engine active","ok");
     addLog("TA","EMA·RSI·MACD·BB·ATR·ADX·Volume·Patterns·S/R — all live","ok");
     fetchBalances();
-    fetchPrices();
-    cfg.pairs.forEach(p=>fetchKlinesAndAnalyze(p));
-  },[creds,isDemo]);
+    if (creds||isDemo) {
+      fetchPrices();
+      // Sequential with 120ms gap — firing all 60 klines at once triggers Bybit rate limit (403)
+      (async()=>{
+        for (const sym of cfg.pairs) {
+          await fetchKlinesAndAnalyze(sym);
+          await new Promise(r=>setTimeout(r,120));
+        }
+      })();
+    }
+  },[creds,isDemo,paperMode]);
 
   /* ── Price + SL/TP monitor loop ── */
   useEffect(()=>{
-    if (!creds&&!isDemo) return;
+    if (!creds&&!isDemo&&!paperMode) return;
     const iv1=setInterval(fetchPrices,5000);
     const iv2=setInterval(monitorPositions,6000);
     return ()=>{ clearInterval(iv1); clearInterval(iv2); };
-  },[creds,isDemo,fetchPrices,monitorPositions]);
+  },[creds,isDemo,paperMode,fetchPrices,monitorPositions]);
 
   /* ── Fetch instrument info (and filter pairs) when exchange connects ── */
   useEffect(()=>{
