@@ -79,8 +79,37 @@ async function bPublic(path, params={}) {
 }
 
 /* ══ BYBIT ══ */
+// Server-time offset cache — fetched once per session, reused for all bbSign calls.
+// This eliminates error 10004 caused by device clock drift vs Bybit server time.
+let _bbTimeOffset = null; // ms difference: bybitServerTime - Date.now()
+let _bbTimeOffsetFetching = null; // in-flight promise guard
+async function bbGetTimeOffset() {
+  if (_bbTimeOffset !== null) return _bbTimeOffset;
+  if (_bbTimeOffsetFetching) return _bbTimeOffsetFetching;
+  _bbTimeOffsetFetching = (async () => {
+    try {
+      const before = Date.now();
+      const r = await fetch(`${DIRECT.bybit}/v3/public/time`);
+      const after = Date.now();
+      const d = await r.json();
+      // timeSecond is seconds; timeNano is nanoseconds — use timeSecond * 1000 for ms
+      const serverMs = parseInt(d.result?.timeSecond || d.result?.timeNano/1e6 || d.time, 10) * (d.result?.timeNano ? 1/1e6 : 1000);
+      const rtt = after - before;
+      _bbTimeOffset = Math.round(serverMs - before - rtt / 2);
+    } catch {
+      _bbTimeOffset = 0; // fallback: no offset, use local time
+    }
+    _bbTimeOffsetFetching = null;
+    return _bbTimeOffset;
+  })();
+  return _bbTimeOffsetFetching;
+}
+// Call once at startup to warm the cache
+bbGetTimeOffset();
+
 async function bbSign(apiKey, apiSecret, path, params={}, method="GET", body=null) {
-  const ts = Date.now().toString(), rw = "20000";
+  const offset = await bbGetTimeOffset();
+  const ts = (Date.now() + offset).toString(), rw = "20000";
   const signStr = method==="GET"
     ? ts+apiKey+rw+new URLSearchParams(params).toString()
     : ts+apiKey+rw+(body?JSON.stringify(body):"");
@@ -91,6 +120,15 @@ async function bbSign(apiKey, apiSecret, path, params={}, method="GET", body=nul
   const res = await fetch(`${DIRECT.bybit}${path}${qs}`,{method,headers:hdrs,body:body?JSON.stringify(body):null});
   if (!res.ok) throw new Error(`Bybit ${res.status}: ${await res.text()}`);
   const d = await res.json();
+  if (d.retCode===10004) {
+    // Reset cached offset so next call re-syncs, then give a clear message
+    _bbTimeOffset = null;
+    throw new Error(
+      `Bybit signature rejected (10004). Your API Secret may be wrong, or device clock is drifting. ` +
+      `Time offset was ${offset}ms. Please verify your API Secret is copied exactly from Bybit, ` +
+      `and that your device time is correct. Retrying will re-sync the clock.`
+    );
+  }
   if (d.retCode!==0) throw new Error(`Bybit ${d.retCode}: ${d.retMsg}`);
   return d.result;
 }
