@@ -1777,6 +1777,7 @@ Respond in JSON only: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","short_reason":"ma
 
     addLog("Scanner",`[${isDemo?"DEMO":"LIVE"}] Scanning batch ${batchPairs.length}/${total} pairs (offset ${batchStart}) · Min conf ${cfg.minConfidence}%`,"info");
 
+    let holdCount = 0;
     for (const symbol of batchPairs) {
       if (!isDemo && validSymbolsRef.current && !validSymbolsRef.current.has(symbol)) continue;
       const price=priceRef.current[symbol];
@@ -1784,12 +1785,12 @@ Respond in JSON only: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","short_reason":"ma
 
       const sig = await fetchKlinesAndAnalyze(symbol);
       if (!sig||sig.action==="HOLD") {
-        addLog("TA",`${symbol} → HOLD (${sig?.reasons?.[0]||"no confluence"}) · Regime: ${sig?.meta?.regime||"?"}`,"info");
+        holdCount++;
         continue;
       }
       const minConf=parseFloat(cfg.minConfidence)||62;
       if (sig.confidence<minConf) {
-        addLog("TA",`${symbol} → ${sig.action} but conf ${sig.confidence}% < ${minConf}% threshold`,"warn");
+        holdCount++;
         continue;
       }
 
@@ -1809,7 +1810,7 @@ Respond in JSON only: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","short_reason":"ma
             addLog("OrderBook",`${symbol} → SELL blocked — strong buy wall (bias ${bookBias.toFixed(1)}%)`,"warn");
             continue;
           }
-          addLog("OrderBook",`${symbol} book bias: ${bookBias>0?"+":""}${bookBias.toFixed(1)}% — OK`,"info");
+          // OK — no log needed, reduces noise
         }
       } catch(_) { /* non-fatal — proceed without book data */ }
 
@@ -1918,6 +1919,16 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
         const tp = sig.action==="BUY" ? price*(1+tpPct/100) : price*(1-tpPct/100);
         const res = await placeOrder(symbol,sig.action,orderQty);
         if (!res) continue;
+        // ── Optimistic balance deduction — prevents same-tick "insufficient balance" ──
+        // balancesRef won't update for ~3s after order. Deduct now so the next symbol
+        // in this batch doesn't try to spend money that's already gone.
+        if (!paperMode && !isDemo) {
+          balancesRef.current = balancesRef.current.map(b =>
+            b.asset === "USDT"
+              ? { ...b, free: String(Math.max(0, parseFloat(b.free) - safeAmt).toFixed(4)) }
+              : b
+          );
+        }
         const pos={
           id:Date.now()+Math.random(), symbol, side:sig.action, entry:price, qty,
           sl, tp, slPct, tpPct, confidence:sig.confidence, reasons:sig.reasons,
@@ -1932,6 +1943,7 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
         );
       }
     }
+    if (holdCount > 0) addLog("Scanner",`${holdCount}/${batchPairs.length} pairs held (no signal)`, "info");
   },[cfg,eligiblePairs,fetchKlinesAndAnalyze,fetchOrderBook,fetchFundingRates,fundingRates,klines,placeOrder,addLog,fetchBalances,paperMode,isDemo]);
 
   /* ── SL/TP Monitor + Trailing Stops ── */
@@ -2226,6 +2238,15 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
       })();
     }
   },[creds,isDemo,paperMode]);
+
+  /* ── Periodic exchange balance refresh (live mode only) ── */
+  useEffect(()=>{
+    if (!creds || isDemo || paperMode) return;
+    // Fetch immediately on connect, then every 30 s so UTA balance stays current
+    fetchBalances();
+    const iv = setInterval(fetchBalances, 30000);
+    return () => clearInterval(iv);
+  },[creds, isDemo, paperMode, fetchBalances]);
 
   /* ── Price + SL/TP monitor loop ── */
   useEffect(()=>{
@@ -3962,7 +3983,7 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
                 }
                 setBotRunning(false);
                 setShowStopModal(false);
-                setTab("wallet");   // always navigate to wallet so balance is visible
+                setTab("dashboard");  // stay on dashboard — balance refreshes in place
               }} style={{padding:"14px 18px",fontFamily:"Orbitron",fontWeight:700,fontSize:10,
                 letterSpacing:1.5,border:"1px solid rgba(0,245,196,.4)",
                 background:"rgba(0,245,196,.08)",color:"#00f5c4",cursor:"pointer",
@@ -4074,7 +4095,7 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
                 }
                 setBotRunning(false);
                 setShowStopModal(false);
-                setTab("wallet");   // navigate to wallet so updated balance is visible
+                setTab("dashboard");  // stay on dashboard — balance refreshes in place
               }} style={{padding:"14px 18px",fontFamily:"Orbitron",fontWeight:700,fontSize:10,
                 letterSpacing:1.5,border:"1px solid rgba(239,68,68,.35)",
                 background:"rgba(239,68,68,.07)",color:"#ef4444",cursor:"pointer",
