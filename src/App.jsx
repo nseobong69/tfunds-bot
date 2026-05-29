@@ -1688,11 +1688,43 @@ Respond in JSON only: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","short_reason":"ma
                       : symbol.endsWith("BTC")  ? symbol.slice(0,-3)
                       : symbol.endsWith("ETH")  ? symbol.slice(0,-3)
                       : symbol.slice(0,-4);
-          const actualFree = parseFloat(balancesRef.current.find(b=>b.asset===base)?.free||"0");
+          let actualFree = parseFloat(balancesRef.current.find(b=>b.asset===base)?.free||"0");
+
+          // If cached balance is zero/stale, fetch live from Bybit right now.
+          // This is the main fix: balancesRef may not have the coin if it was
+          // received as a BUY fee credit and the balance hasn't been refreshed yet.
+          if (actualFree <= 0) {
+            try {
+              for (const accountType of ["UNIFIED","SPOT","CONTRACT"]) {
+                try {
+                  const liveWallet = await bbSign(k, s, "/v5/account/wallet-balance", {accountType});
+                  const coins = liveWallet.list?.[0]?.coin || [];
+                  const coinData = coins.find(c => c.coin === base);
+                  if (coinData) {
+                    const atw = parseFloat(coinData.availableToWithdraw||"0");
+                    const wb  = parseFloat(coinData.walletBalance||"0");
+                    actualFree = atw > 0 ? atw : wb;
+                    if (actualFree > 0) break;
+                  }
+                } catch(_) { /* try next account type */ }
+              }
+              if (actualFree > 0)
+                addLog("Executor",`[bybit] Live balance fetched for ${base}: ${actualFree}`,"info");
+              else
+                addLog("Executor",`[bybit] No balance found for ${base} — applying fee buffer`,"warn");
+            } catch(_) {}
+          }
+
           if (actualFree > 0 && actualFree < adjQty) {
             const cappedQty = Math.floor(actualFree * factor) / factor;
-            addLog("Executor",`[bybit] SELL ${symbol}: capping qty ${adjQty} → ${cappedQty} (actual balance after fees)`,"info");
+            addLog("Executor",`[bybit] SELL ${symbol}: capping qty ${adjQty} → ${cappedQty} (actual balance)`,"info");
             adjQty = cappedQty;
+          } else if (actualFree > 0 && adjQty >= actualFree) {
+            // adjQty already within balance — use it as-is (already rounded down)
+          } else if (actualFree <= 0) {
+            // Last resort: apply 0.2% fee buffer to avoid "insufficient balance" rejection
+            adjQty = Math.floor(adjQty * 0.998 * factor) / factor;
+            addLog("Executor",`[bybit] SELL ${symbol}: fee buffer applied → qty=${adjQty}`,"warn");
           }
         }
 
@@ -3966,19 +3998,21 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
                       totalDollarPnl>=0?"ok":"warn");
                   } else {
                     // Live — await every sell order sequentially, then re-fetch balance.
-                    // We iterate closedNow (snapshot taken above) — posRef.current
-                    // is already cleared by setOpenPos([]) at this point in some renders.
                     addLog("Bot",`Placing ${closedNow.length} sell order${closedNow.length!==1?"s":""}…`,"info");
+                    let sellSuccessCount1 = 0;
                     for (const pos of closedNow) {
                       const closeSide = pos.side==="BUY"?"SELL":"BUY";
-                      await placeOrder(pos.symbol,closeSide,pos.qty);
+                      const result = await placeOrder(pos.symbol,closeSide,pos.qty);
+                      if (result) { sellSuccessCount1++; }
+                      else { addLog("Bot",`⚠ Sell failed for ${pos.symbol} — check Bybit manually`,"error"); }
                     }
-                    // Double-refresh: first at 3 s, second at 7 s (orders may take a moment to settle)
+                    // Triple-refresh: immediate + 3 s + 8 s so USDT balance updates in the bot
+                    fetchBalances();
                     setTimeout(()=>fetchBalances(), 3000);
-                    setTimeout(()=>fetchBalances(), 7000);
+                    setTimeout(()=>fetchBalances(), 8000);
                     addLog("Bot",
-                      `All ${closedNow.length} position${closedNow.length!==1?"s":""} closed — Net P&L: ${totalDollarPnl>=0?"+":""}$${totalDollarPnl.toFixed(2)} — balance refreshing from exchange`,
-                      totalDollarPnl>=0?"ok":"warn");
+                      `${sellSuccessCount1}/${closedNow.length} position${closedNow.length!==1?"s":""} sold — Net P&L: ${totalDollarPnl>=0?"+":""}$${totalDollarPnl.toFixed(2)} — USDT refreshing`,
+                      sellSuccessCount1===closedNow.length?"ok":"warn");
                   }
                 }
                 setBotRunning(false);
@@ -4031,6 +4065,7 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
                     const currentPrices = priceRef.current;
                     const closedNow = [];
                     addLog("Bot",`Placing ${posSnapshot.length} sell order${posSnapshot.length!==1?"s":""}…`,"info");
+                    let sellSuccessCount2 = 0;
                     for (const pos of posSnapshot) {
                       const price = currentPrices[pos.symbol]||pos.entry;
                       const pnlPct = pos.side==="BUY"
@@ -4038,13 +4073,17 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
                         :(pos.entry-price)/pos.entry*100;
                       closedNow.push({...pos,closePrice:price,pnl:pnlPct,closeTs:new Date(),result:"STOPPED"});
                       addLog("Bot",`Force-closed ${pos.symbol} on STOP — PnL: ${fmtP(pnlPct)}`,pnlPct>=0?"ok":"warn");
-                      await placeOrder(pos.symbol,pos.side==="BUY"?"SELL":"BUY",pos.qty);
+                      const result = await placeOrder(pos.symbol,pos.side==="BUY"?"SELL":"BUY",pos.qty);
+                      if (result) { sellSuccessCount2++; }
+                      else { addLog("Bot",`⚠ Sell failed for ${pos.symbol} — check Bybit manually`,"error"); }
                     }
                     setTrades(prev=>[...closedNow,...prev.slice(0,199)]);
                     setOpenPos([]);
+                    // Triple-refresh: immediate + 3 s + 8 s so USDT balance updates in the bot
+                    fetchBalances();
                     setTimeout(()=>fetchBalances(), 3000);
-                    setTimeout(()=>fetchBalances(), 7000);
-                    addLog("Bot",`All ${closedNow.length} position${closedNow.length!==1?"s":""} sold — balance refreshing. Opening wallet.`,"ok");
+                    setTimeout(()=>fetchBalances(), 8000);
+                    addLog("Bot",`${sellSuccessCount2}/${posSnapshot.length} position${posSnapshot.length!==1?"s":""} sold — USDT balance refreshing. Opening wallet.`,sellSuccessCount2===posSnapshot.length?"ok":"warn");
                   }
                 }
                 setBotRunning(false);
@@ -4078,19 +4117,25 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
                   totalDollarPnl += (pnlPct / 100) * (pos.qty * pos.entry);
                   closedNow.push({...pos, closePrice:price, pnl:pnlPct, closeTs:new Date(), result:"STOPPED"});
                   // Await each sell — fire-and-forget was silently dropping orders
-                  await placeOrder(pos.symbol, pos.side==="BUY"?"SELL":"BUY", pos.qty);
-                  addLog("Bot", `Force-closed ${pos.symbol} on STOP — PnL: ${fmtP(pnlPct)}`, pnlPct>=0?"ok":"warn");
+                  const result = await placeOrder(pos.symbol, pos.side==="BUY"?"SELL":"BUY", pos.qty);
+                  if (result) {
+                    addLog("Bot", `Force-closed ${pos.symbol} on STOP — PnL: ${fmtP(pnlPct)}`, pnlPct>=0?"ok":"warn");
+                  } else {
+                    addLog("Bot", `⚠ Sell FAILED for ${pos.symbol} — check Bybit app manually`, "error");
+                  }
                 }
                 if (closedNow.length > 0) {
                   setTrades(prev => [...closedNow, ...prev.slice(0, 199)]);
                   setOpenPos([]);
+                  const soldCount = closedNow.length;
                   addLog("Bot",
-                    `All ${closedNow.length} position${closedNow.length!==1?"s":""} closed — Net P&L: ${totalDollarPnl>=0?"+":""}$${totalDollarPnl.toFixed(2)}`,
+                    `${soldCount} position${soldCount!==1?"s":""} processed — Net P&L: ${totalDollarPnl>=0?"+":""}$${totalDollarPnl.toFixed(2)}`,
                     totalDollarPnl>=0?"ok":"warn");
-                  // Live: re-fetch real balance after all orders settle (double-refresh)
+                  // Live: triple-refresh — immediate + 3 s + 8 s so USDT shows up in bot wallet
                   if (!paperMode && !isDemo) {
+                    fetchBalances();
                     setTimeout(()=>fetchBalances(), 3000);
-                    setTimeout(()=>fetchBalances(), 7000);
+                    setTimeout(()=>fetchBalances(), 8000);
                   }
                 }
                 setBotRunning(false);
