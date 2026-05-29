@@ -1076,6 +1076,7 @@ export default function App() {
   /* ── New feature state ── */
   const trailingStops  = useRef({});          // { [posId]: { highWater, lowWater } }
   const obCacheRef     = useRef({});          // { [symbol]: {bids,asks,bidVol,askVol,bias,ts} }
+  const scanBatchRef   = useRef(0);           // rotating batch index for pair scanning          // { [symbol]: {bids,asks,bidVol,askVol,bias,ts} }
   const [btResult,     setBtResult]     = useState(null);
   const [btRunning,    setBtRunning]    = useState(false);
   const [btSymbol,     setBtSymbol]     = useState("BTCUSDT");
@@ -1140,22 +1141,32 @@ export default function App() {
         const data = await bSign(k,s,{},"/api/v3/account");
         setBalances((data.balances||[]).filter(b=>parseFloat(b.free)>0||parseFloat(b.locked)>0));
       } else if (ex==="bybit") {
-        // Try account types in priority order: UNIFIED → SPOT → CONTRACT
-        let coins = [];
-        const bbAccountTypes = ["UNIFIED","SPOT","CONTRACT"];
-        for (const accountType of bbAccountTypes) {
+        // UTA (Unified Trading Account) uses accountType=UNIFIED exclusively.
+        // availableToWithdraw is the correct "free for spot" field at coin level.
+        // availableBalance only exists at account level, NOT coin level — do NOT use it here.
+        let coins = [], detectedType = "";
+        for (const accountType of ["UNIFIED","SPOT","CONTRACT"]) {
           try {
             const data = await bbSign(k,s,"/v5/account/wallet-balance",{accountType});
             const list = data.list?.[0]?.coin||[];
-            if (list.length > 0) { coins = list; break; }
-          } catch(_) { /* try next account type */ }
+            if (list.length > 0) { coins = list; detectedType = accountType; break; }
+          } catch(_) { /* try next */ }
         }
-        setBalances(coins.filter(c=>parseFloat(c.walletBalance||0)>0)
-          .map(c=>({
-            asset: c.coin,
-            free: c.availableBalance||c.availableToWithdraw||c.equity||c.walletBalance||"0",
-            locked: "0"
-          })));
+        if (detectedType) addLog("Account",`Bybit account type: ${detectedType}`,"info");
+        setBalances(
+          coins
+            // Show any coin that has a non-zero wallet balance (even if temporarily unavailable)
+            .filter(c => parseFloat(c.walletBalance||0) > 0 || parseFloat(c.availableToWithdraw||0) > 0)
+            .map(c => {
+              // availableToWithdraw is the correct "free for spot" field on UTA coin level.
+              // Must use parseFloat comparison — "0" is truthy so string || chaining is wrong.
+              const atw = parseFloat(c.availableToWithdraw||0);
+              const wb  = parseFloat(c.walletBalance||0);
+              const free   = String(atw > 0 ? atw : wb);
+              const locked = String(Math.max(0, wb - atw).toFixed(4));
+              return { asset: c.coin, free, locked };
+            })
+        );
       } else if (ex==="okx") {
         const data = await okxSign(k,s,p,"/api/v5/account/balance");
         const details = data[0]?.details||[];
@@ -1712,24 +1723,33 @@ Respond in JSON only: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","short_reason":"ma
           "POST",{category:"spot",symbol,side:side==="BUY"?"Buy":"Sell",orderType:"Market",qty:qtyStr});
         addLog("Executor",`✓ Bybit order: ${side} ${symbol} qty=${qtyStr} #${data.orderId}`,"ok");
 
-        // ── Refresh real balance from exchange after order settles (~2.5s) ──
+        // ── Refresh real balance from exchange after order settles ──
+        // Double-refresh: first pass catches most cases; second handles slow UTA settlement.
         setTimeout(()=>fetchBalances(), 2500);
+        setTimeout(()=>fetchBalances(), 6000);
       } else if (ex==="okx") {
         const instId = toExSymbol(symbol,"okx");
         data = await okxSign(k,s,p,"/api/v5/trade/order","POST",
           {instId,tdMode:"cash",side:side.toLowerCase(),ordType:"market",sz:String(quantity)});
         addLog("Executor",`✓ OKX order: ${side} ${symbol} #${data[0]?.ordId}`,"ok");
+        // Refresh balance so USDT/coin reflects the trade
+        setTimeout(()=>fetchBalances(), 3000);
+        setTimeout(()=>fetchBalances(), 7000);
       } else if (ex==="kucoin") {
         const kcSym = toExSymbol(symbol,"kucoin");
         data = await kcSign(k,s,p,"/api/v1/orders","POST",
           {clientOid:`tbot-${Date.now()}`,side:side.toLowerCase(),symbol:kcSym,type:"market",size:String(quantity)});
         addLog("Executor",`✓ KuCoin order: ${side} ${symbol} #${data.orderId}`,"ok");
+        setTimeout(()=>fetchBalances(), 3000);
+        setTimeout(()=>fetchBalances(), 7000);
       } else {
         // Coinbase Advanced Trade
         data = await cbSign(k,s,"/api/v3/brokerage/orders","POST",
           {client_order_id:`tbot-${Date.now()}`,product_id:symbol.replace("USDT","-USDT"),
            side,order_configuration:{market_market_ioc:{base_size:String(quantity)}}});
         addLog("Executor",`✓ Coinbase order: ${side} ${symbol}`,"ok");
+        setTimeout(()=>fetchBalances(), 3000);
+        setTimeout(()=>fetchBalances(), 7000);
       }
       return data;
     } catch(e) {
@@ -1740,8 +1760,6 @@ Respond in JSON only: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","short_reason":"ma
 
   /* ── Bot tick — TA + Order Book + AI + Funding Rate (fully automatic) ── */
   const runBotTick = useCallback(async()=>{
-    addLog("Scanner",`[${isDemo?"DEMO":"LIVE"}] Scanning ${eligiblePairs.length} pairs · ATR SL/TP · Order Book · AI filter · Min conf ${cfg.minConfidence}%`,"info");
-
     // ── Auto-fetch funding rates every 8 hours to keep data fresh ──
     const now = Date.now();
     const lastFunding = runBotTick._lastFundingFetch||0;
@@ -1750,7 +1768,16 @@ Respond in JSON only: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","short_reason":"ma
       fetchFundingRates().catch(()=>{});
     }
 
-    for (const symbol of eligiblePairs) {
+    // ── Scan only 10 pairs per tick, rotating through the full list ──
+    const BATCH_SIZE = 10;
+    const total = eligiblePairs.length;
+    const batchStart = (scanBatchRef.current * BATCH_SIZE) % Math.max(total, 1);
+    const batchPairs = eligiblePairs.slice(batchStart, batchStart + BATCH_SIZE);
+    scanBatchRef.current = batchStart + BATCH_SIZE >= total ? 0 : scanBatchRef.current + 1;
+
+    addLog("Scanner",`[${isDemo?"DEMO":"LIVE"}] Scanning batch ${batchPairs.length}/${total} pairs (offset ${batchStart}) · Min conf ${cfg.minConfidence}%`,"info");
+
+    for (const symbol of batchPairs) {
       if (!isDemo && validSymbolsRef.current && !validSymbolsRef.current.has(symbol)) continue;
       const price=priceRef.current[symbol];
       if (!price) continue;
@@ -1960,9 +1987,12 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
           const dollarPnl=(pnlPct/100)*(pos.qty*pos.entry);
           setBalances(prev=>prev.map(b=>b.asset==="USDT"?{...b,free:String((parseFloat(b.free)+dollarPnl).toFixed(2))}:b));
         } else {
+          // Live: place the sell first (done above), then double-refresh so UTA USDT
+          // balance reflects the returned proceeds after exchange settlement.
           const dollarPnl=(pnlPct/100)*(pos.qty*pos.entry);
-          setTimeout(()=>fetchBalances(), 2500);
-          addLog("Balance",`Position closed: ${pnlPct>=0?"+$"+Math.abs(dollarPnl).toFixed(4):"-$"+Math.abs(dollarPnl).toFixed(4)} P&L from ${pos.symbol}`,"ok");
+          setTimeout(()=>fetchBalances(), 3000);   // first refresh after ~3 s
+          setTimeout(()=>fetchBalances(), 7000);   // second refresh in case first was early
+          addLog("Balance",`${pos.symbol} ${result} closed: ${pnlPct>=0?"+$"+Math.abs(dollarPnl).toFixed(4):"-$"+Math.abs(dollarPnl).toFixed(4)} — USDT returning to UTA`,"ok");
         }
         addLog("Risk",`${pos.symbol} hit ${result} @ $${priceFmt(price)} — PnL: ${fmtP(pnlPct)}`,hitTP||isTrail?"ok":"warn");
       }
@@ -3922,8 +3952,9 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
                       const closeSide = pos.side==="BUY"?"SELL":"BUY";
                       await placeOrder(pos.symbol,closeSide,pos.qty);
                     }
-                    // Wait for all orders to settle, then refresh
+                    // Double-refresh: first at 3 s, second at 7 s (orders may take a moment to settle)
                     setTimeout(()=>fetchBalances(), 3000);
+                    setTimeout(()=>fetchBalances(), 7000);
                     addLog("Bot",
                       `All ${closedNow.length} position${closedNow.length!==1?"s":""} closed — Net P&L: ${totalDollarPnl>=0?"+":""}$${totalDollarPnl.toFixed(2)} — balance refreshing from exchange`,
                       totalDollarPnl>=0?"ok":"warn");
@@ -3931,6 +3962,7 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
                 }
                 setBotRunning(false);
                 setShowStopModal(false);
+                setTab("wallet");   // always navigate to wallet so balance is visible
               }} style={{padding:"14px 18px",fontFamily:"Orbitron",fontWeight:700,fontSize:10,
                 letterSpacing:1.5,border:"1px solid rgba(0,245,196,.4)",
                 background:"rgba(0,245,196,.08)",color:"#00f5c4",cursor:"pointer",
@@ -3990,6 +4022,7 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
                     setTrades(prev=>[...closedNow,...prev.slice(0,199)]);
                     setOpenPos([]);
                     setTimeout(()=>fetchBalances(), 3000);
+                    setTimeout(()=>fetchBalances(), 7000);
                     addLog("Bot",`All ${closedNow.length} position${closedNow.length!==1?"s":""} sold — balance refreshing. Opening wallet.`,"ok");
                   }
                 }
@@ -4033,13 +4066,15 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
                   addLog("Bot",
                     `All ${closedNow.length} position${closedNow.length!==1?"s":""} closed — Net P&L: ${totalDollarPnl>=0?"+":""}$${totalDollarPnl.toFixed(2)}`,
                     totalDollarPnl>=0?"ok":"warn");
-                  // Live: re-fetch real balance after all orders settle
+                  // Live: re-fetch real balance after all orders settle (double-refresh)
                   if (!paperMode && !isDemo) {
                     setTimeout(()=>fetchBalances(), 3000);
+                    setTimeout(()=>fetchBalances(), 7000);
                   }
                 }
                 setBotRunning(false);
                 setShowStopModal(false);
+                setTab("wallet");   // navigate to wallet so updated balance is visible
               }} style={{padding:"14px 18px",fontFamily:"Orbitron",fontWeight:700,fontSize:10,
                 letterSpacing:1.5,border:"1px solid rgba(239,68,68,.35)",
                 background:"rgba(239,68,68,.07)",color:"#ef4444",cursor:"pointer",
