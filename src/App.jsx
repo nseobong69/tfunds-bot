@@ -22,7 +22,7 @@ async function hmacSHA256B64(secret, message) {
 /* ═══════════════════════════════════════════════════
    EXCHANGE API LAYER  —  Binance · Bybit · OKX · KuCoin · Coinbase
 ═══════════════════════════════════════════════════ */
-const PROXY_URL = "https://tfunds-proxy.onrender.com"; // ← update after deploy
+const PROXY_URL = "https://tfunds-bot.onrender.com";
 const BASE    = `${PROXY_URL}/proxy/binance`;
 const BASE_CB = `${PROXY_URL}/proxy/coinbase`;
 const BASE_BB = `${PROXY_URL}/proxy/bybit`;
