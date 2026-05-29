@@ -135,9 +135,16 @@ async function bbSign(apiKey, apiSecret, path, params={}, method="GET", body=nul
   return d.result;
 }
 async function bbPublic(path, params={}) {
-  // Call Bybit directly — Render/cloud IPs are blocked by Bybit for public endpoints (returns 403)
+  // Try proxy first (avoids CORS/network issues on Android browsers),
+  // fall back to direct Bybit if proxy fails.
   const qs = new URLSearchParams(params).toString();
-  const res = await fetch(`${DIRECT.bybit}${path}${qs?"?"+qs:""}`);
+  const proxyUrl  = `${BASE_BB}${path}${qs?"?"+qs:""}`;
+  const directUrl = `${DIRECT.bybit}${path}${qs?"?"+qs:""}`;
+  let res;
+  try { res = await fetch(proxyUrl); } catch(_) { res = null; }
+  if (!res || !res.ok) {
+    try { res = await fetch(directUrl); } catch(e) { throw new Error(`Bybit pub network error`); }
+  }
   if (!res.ok) throw new Error(`Bybit pub ${res.status}`);
   const d = await res.json();
   if (d.retCode!==0) throw new Error(`Bybit: ${d.retMsg}`);
@@ -1118,8 +1125,8 @@ export default function App() {
       setBalances([{asset:"USDT",free:"10000.00",locked:"0"},{asset:"BTC",free:"0.05",locked:"0"},{asset:"ETH",free:"0.8",locked:"0"}]);
       return;
     }
-    // Paper mode — seed virtual balance if none exists yet, preserve it once set
-    if (paperMode && !creds) {
+    // Paper mode — always use virtual balance regardless of whether creds exist
+    if (paperMode) {
       setBalances(prev => {
         if (prev.find(b=>b.asset==="USDT")) return prev;
         return [{asset:"USDT",free:"10000.00",locked:"0"},{asset:"BTC",free:"0",locked:"0"}];
@@ -1494,9 +1501,18 @@ Respond in JSON only: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","short_reason":"ma
         })
       });
       const data=await resp.json();
-      const text=data.choices?.[0]?.message?.content||"{}";
-      const clean=text.replace(/```json|```/g,"").trim();
-      const parsed=JSON.parse(clean);
+      const text=data.choices?.[0]?.message?.content||"";
+      let parsed={verdict:"CAUTION",short_reason:"AI unavailable",risk:"MED",confidence_adj:0};
+      if (text) {
+        try {
+          const clean=text.replace(/```json|```/g,"").trim();
+          const s=clean.indexOf("{"),e=clean.lastIndexOf("}");
+          if(s!==-1&&e!==-1){const p=JSON.parse(clean.slice(s,e+1));if(p.verdict)parsed=p;}
+        } catch(_){}
+      }
+      parsed.verdict=parsed.verdict||"CAUTION";
+      parsed.short_reason=parsed.short_reason||"no reason";
+      parsed.risk=parsed.risk||"MED";
       setAiSignals(prev=>({...prev,[symbol]:{...parsed,ts:Date.now()}}));
       addLog("AI",`${symbol} → ${parsed.verdict}: ${parsed.short_reason}`,"ok");
     } catch(e){
@@ -1806,8 +1822,24 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
           body:JSON.stringify({model:"llama-3.1-8b-instant",max_tokens:120,messages:[{role:"user",content:prompt}]})
         });
         const aiData = await resp.json();
-        const aiText = aiData.choices?.[0]?.message?.content||"{}";
-        const aiJson = JSON.parse(aiText.replace(/```json|```/g,"").trim());
+        const aiText = aiData.choices?.[0]?.message?.content||"";
+        let aiJson = {verdict:"CAUTION",short_reason:"AI parse error",risk:"MED"};
+        if (aiText) {
+          try {
+            // Strip markdown fences and any leading/trailing non-JSON characters
+            const clean = aiText.replace(/```json|```/g,"").trim();
+            const jsonStart = clean.indexOf("{");
+            const jsonEnd   = clean.lastIndexOf("}");
+            if (jsonStart !== -1 && jsonEnd !== -1) {
+              const parsed = JSON.parse(clean.slice(jsonStart, jsonEnd+1));
+              if (parsed.verdict) aiJson = parsed;
+            }
+          } catch(_) { /* keep default CAUTION */ }
+        }
+        // Normalise fields so they are never undefined
+        aiJson.verdict     = aiJson.verdict     || "CAUTION";
+        aiJson.short_reason= aiJson.short_reason|| "no reason";
+        aiJson.risk        = aiJson.risk        || "MED";
         setAiSignals(prev=>({...prev,[symbol]:{...aiJson,ts:Date.now()}}));
 
         if (aiJson.verdict==="REJECT") {
@@ -1817,7 +1849,7 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
         addLog("AI",`${symbol} → AI ${aiJson.verdict}: ${aiJson.short_reason} · Risk: ${aiJson.risk}`,"ok");
       } catch(e) {
         // AI failed — log but don't block the trade (non-fatal)
-        addLog("AI",`${symbol} AI check failed (${e.message}) — proceeding anyway`,"warn");
+        addLog("AI",`${symbol} AI check skipped (${e.message}) — proceeding`,"warn");
       }
 
       // ── All gates passed — execute trade ──
