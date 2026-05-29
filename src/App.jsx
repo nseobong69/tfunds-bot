@@ -92,8 +92,10 @@ async function bbGetTimeOffset() {
       const r = await fetch(`${DIRECT.bybit}/v3/public/time`);
       const after = Date.now();
       const d = await r.json();
-      // timeSecond is seconds; timeNano is nanoseconds — use timeSecond * 1000 for ms
-      const serverMs = parseInt(d.result?.timeSecond || d.result?.timeNano/1e6 || d.time, 10) * (d.result?.timeNano ? 1/1e6 : 1000);
+      // Bybit returns timeSecond (Unix seconds string) and timeNano (nanoseconds string)
+      // Always derive ms from timeSecond * 1000 — safest across all Bybit API versions
+      const timeSecond = d.result?.timeSecond ?? d.result?.time_second ?? d.time;
+      const serverMs = Number(timeSecond) * 1000;
       const rtt = after - before;
       _bbTimeOffset = Math.round(serverMs - before - rtt / 2);
     } catch {
