@@ -1056,7 +1056,7 @@ export default function App() {
     // Push initial history entry so the very first back press works
     window.history.replaceState({ tab: tab }, "", window.location.pathname);
     return () => window.removeEventListener("popstate", onPop);
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []); // eslint-disable-line
   const [cfg,        setCfg]        = useState({
     pairs:     TOP_PAIRS,
     amount:    "50",
