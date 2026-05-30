@@ -1080,8 +1080,8 @@ export default function App() {
     useAtrSl:  true,      // use ATR-based SL/TP when available
     trailingPct: "1.5",   // trailing stop % (0 = disabled)
     maxPositions: "20",   // hard cap on concurrent positions
-    totalBudget:  "300",  // max USDT to deploy across ALL open positions
-    numCoins:     "6",    // auto-derived: floor(totalBudget / amount)
+    totalBudget:  "1000",  // max USDT to deploy across ALL open positions
+    numCoins:     "20",   // auto-derived: floor(totalBudget / amount)
   });
 
   /* ── Wallet state ── */
@@ -1094,9 +1094,9 @@ export default function App() {
   const [showStopModal, setShowStopModal] = useState(false); // Stop trading summary modal
   const [showStartModal,setShowStartModal]= useState(false); // Live start confirmation modal
   const [liveTradeAmt,  setLiveTradeAmt]  = useState("");    // per-coin amount (auto-computed)
-  const [liveTotalBudget,setLiveTotalBudget]=useState("300"); // total USDT cap for this session
+  const [liveTotalBudget,setLiveTotalBudget]=useState("1000"); // total USDT cap for this session
   const [livePerTradeAmt,setLivePerTradeAmt]=useState("50");  // USDT per individual position
-  const [liveNumCoins,  setLiveNumCoins]  = useState("6");   // auto-derived: floor(totalBudget/perTrade)
+  const [liveNumCoins,  setLiveNumCoins]  = useState("20");  // auto-derived: floor(totalBudget/perTrade)
   const [stopBalance,   setStopBalance]   = useState("");    // stop bot if USDT drops below this
   const [wdForm,        setWdForm]        = useState({ coin:"USDT", network:"BSC", address:"", amount:"" });
   const [wdStatus,      setWdStatus]      = useState(null);  // { type, msg }
@@ -2056,7 +2056,10 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
           aiJson.short_reason= aiJson.short_reason|| "no reason";
           aiJson.risk        = aiJson.risk        || "MED";
           setAiSignals(prev=>({...prev,[symbol]:{...aiJson,ts:Date.now()}}));
-          addLog("AI",`${symbol} → AI ${aiJson.verdict}: ${aiJson.short_reason} · Risk: ${aiJson.risk}`,"ok");
+          // Only log AI verdicts that are actionable (suppress noisy parse error spam)
+          if (aiJson.verdict !== "CAUTION" || aiJson.short_reason !== "AI parse error") {
+            addLog("AI",`${symbol} → AI ${aiJson.verdict}: ${aiJson.short_reason} · Risk: ${aiJson.risk}`,"ok");
+          }
         } catch(e) { /* silent — AI is non-critical */ }
       })();
 
@@ -2074,7 +2077,13 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
         setOpenPos(prev=>prev.filter(p=>p.id!==existing.id));
         if(paperMode||isDemo){
           const dollarPnl=(pnlPct/100)*(existing.qty*existing.entry);
-          setBalances(prev=>prev.map(b=>b.asset==="USDT"?{...b,free:String((parseFloat(b.free)+dollarPnl).toFixed(2))}:b));
+          const originalCapital = existing.qty * existing.entry;
+          const totalReturn = originalCapital + dollarPnl;  // return capital + profit/loss
+          const updatedBals = balancesRef.current.map(b=>
+            b.asset==="USDT"?{...b,free:String((parseFloat(b.free)+totalReturn).toFixed(2))}:b
+          );
+          balancesRef.current = updatedBals;
+          setBalances(updatedBals);
         } else {
           setTimeout(()=>fetchBalances(), 2500);
         }
@@ -3353,7 +3362,7 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
               {/* Settings grid */}
               <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,marginBottom:20}}>
                 {[
-                  ["TOTAL BUDGET (USDT)","totalBudget","300"],
+                  ["TOTAL BUDGET (USDT)","totalBudget","1000"],
                   ["AMOUNT PER TRADE (USDT)","amount","50"],
                   ["MAX OPEN POSITIONS","maxPositions","6"],
                   ["FALLBACK STOP LOSS %","stopLoss","2"],
@@ -3369,7 +3378,7 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
                         const v=e.target.value;
                         if (key==="totalBudget"||key==="amount") {
                           // auto-derive maxPositions when budget or perTrade changes
-                          const budget = key==="totalBudget" ? parseFloat(v)||0 : parseFloat(cfg.totalBudget)||300;
+                          const budget = key==="totalBudget" ? parseFloat(v)||0 : parseFloat(cfg.totalBudget)||1000;
                           const per    = key==="amount"       ? parseFloat(v)||0 : parseFloat(cfg.amount)||50;
                           const slots  = Math.max(1, Math.floor(budget/Math.max(0.01,per)));
                           setCfg(c=>({...c,[key]:v,numCoins:String(slots),maxPositions:String(slots)}));
