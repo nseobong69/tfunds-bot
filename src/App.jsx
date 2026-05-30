@@ -2566,17 +2566,27 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
 
   /* ── Performance Stats ── */
   const stats = useMemo(()=>{
-    if (!trades.length) return { winRate:"—", totalPnL:0, avgRR:"—", maxDD:0, streak:0 };
+    if (!trades.length) return { winRate:"—", totalPnL:0, totalDollarPnL:0, avgRR:"—", maxDD:0, streak:0 };
     const wins  = trades.filter(t=>t.pnl>0);
     const winRate = (wins.length/trades.length*100).toFixed(1);
     const totalPnL = trades.reduce((s,t)=>s+t.pnl,0);
+    // Dollar PnL: use capitalUsed if stored, fallback to qty*entry
+    const totalDollarPnL = trades.reduce((s,t)=>{
+      const cap = t.capitalUsed || (t.qty * t.entry) || 0;
+      return s + (t.pnl/100)*cap;
+    }, 0);
     const avgRR = wins.length && trades.filter(t=>t.pnl<0).length
       ? (wins.reduce((s,t)=>s+t.pnl,0)/wins.length /
          (Math.abs(trades.filter(t=>t.pnl<0).reduce((s,t)=>s+t.pnl,0)) / trades.filter(t=>t.pnl<0).length)).toFixed(2)
       : "—";
-    // Max drawdown (peak-to-trough)
+    // Max drawdown (peak-to-trough) in dollars
     let peak=0, dd=0, running=0;
-    [...trades].reverse().forEach(t=>{ running+=t.pnl; if(running>peak) peak=running; dd=Math.min(dd,running-peak); });
+    [...trades].reverse().forEach(t=>{
+      const cap = t.capitalUsed || (t.qty * t.entry) || 0;
+      running += (t.pnl/100)*cap;
+      if(running>peak) peak=running;
+      dd=Math.min(dd,running-peak);
+    });
     // Current streak
     let streak=0;
     for (let i=0;i<trades.length;i++) {
@@ -2585,7 +2595,7 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
       else if (trades[i].pnl<0&&streak<0) streak--;
       else break;
     }
-    return { winRate, totalPnL: totalPnL.toFixed(2), avgRR, maxDD: dd.toFixed(2), streak };
+    return { winRate, totalPnL: totalPnL.toFixed(2), totalDollarPnL: totalDollarPnL.toFixed(2), avgRR, maxDD: dd.toFixed(2), streak };
   },[trades]);
 
   const floatPnL = posWithPnl.reduce((s,p)=>s+p.pnl,0).toFixed(2);
@@ -2864,7 +2874,7 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
               gridTemplateColumns:"repeat(7,1fr)",gap:8}}>
               {[
                 ["WIN RATE",       stats.winRate==="—"?"—":`${stats.winRate}%`, null],
-                ["TOTAL P&L",      stats.totalPnL==="0.00"?"—":fmtP(parseFloat(stats.totalPnL)), parseFloat(stats.totalPnL)],
+                ["TOTAL P&L",      stats.totalDollarPnL==="0.00"?"—":`${parseFloat(stats.totalDollarPnL)>=0?"+":""}$${stats.totalDollarPnL}`, parseFloat(stats.totalDollarPnL)],
                 ["OPEN FLOAT",     parseFloat(floatPnL)===0?"—":fmtP(parseFloat(floatPnL)), parseFloat(floatPnL)],
                 ["AVG R:R",        stats.avgRR==="—"?stats.avgRR:`${stats.avgRR}:1`, null],
                 ["MAX DRAWDOWN",   stats.maxDD==="0.00"?"—":fmtP(parseFloat(stats.maxDD)), parseFloat(stats.maxDD)],
@@ -4374,17 +4384,19 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
                 });
 
                 if (isDemo||paperMode) {
-                  // Paper/demo: update UI immediately
+                  // Paper/demo: update UI immediately — use balancesRef (always current, never stale)
                   if (closedNow.length>0) {
                     setTrades(prev=>[...closedNow,...prev.slice(0,199)]);
                     setOpenPos([]);
-                    setBalances(prev=>prev.map(b=>
+                    const updatedBals1 = balancesRef.current.map(b=>
                       b.asset==="USDT"
                         ?{...b,free:String((parseFloat(b.free)+totalCapitalReturned+totalDollarPnl).toFixed(2))}
                         :b
-                    ));
+                    );
+                    balancesRef.current = updatedBals1;
+                    setBalances(updatedBals1);
                     addLog("Bot",
-                      `All ${closedNow.length} position${closedNow.length!==1?"s":""} closed — Net P&L: ${totalDollarPnl>=0?"+":""}$${totalDollarPnl.toFixed(2)} added to balance`,
+                      `All ${closedNow.length} position${closedNow.length!==1?"s":""} closed — Capital $${totalCapitalReturned.toFixed(2)} + Net P&L ${totalDollarPnl>=0?"+":""}$${totalDollarPnl.toFixed(2)} → balance updated`,
                       totalDollarPnl>=0?"ok":"warn");
                   }
                 } else {
@@ -4453,12 +4465,14 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
                   if (closedNow.length>0) {
                     setTrades(prev=>[...closedNow,...prev.slice(0,199)]);
                     setOpenPos([]);
-                    setBalances(prev=>prev.map(b=>
+                    const updatedBals2 = balancesRef.current.map(b=>
                       b.asset==="USDT"
                         ?{...b,free:String((parseFloat(b.free)+totalCapitalReturned+totalDollarPnl).toFixed(2))}
                         :b
-                    ));
-                    addLog("Bot",`Positions closed — P&L credited. Opening wallet panel.`,"ok");
+                    );
+                    balancesRef.current = updatedBals2;
+                    setBalances(updatedBals2);
+                    addLog("Bot",`Positions closed — Capital $${totalCapitalReturned.toFixed(2)} + P&L ${totalDollarPnl>=0?"+":""}$${totalDollarPnl.toFixed(2)} credited. Opening wallet panel.`,"ok");
                   }
                 } else {
                   // Live — sell from actual Bybit wallet FIRST, then clear UI
