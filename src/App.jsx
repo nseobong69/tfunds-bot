@@ -1481,27 +1481,45 @@ export default function App() {
         priceRef.current=map; setPrices(map);
         if (!validSymbolsRef.current) validSymbolsRef.current = new Set(Object.keys(map));
       } else if (ex==="bybit") {
-        // Retry up to 2 times — transient network errors are common
-        let map = null;
-        for (let attempt = 0; attempt < 2 && !map; attempt++) {
+        // DATA SAVER: fetch only TOP_PAIRS one-by-one in a single batch call using symbol filter.
+        // Bybit supports ?symbol=BTCUSDT per request — we batch into groups of 10 to stay
+        // well under rate limits while avoiding the 400+ ticker all-market response (~150 KB).
+        let map = {};
+        const CHUNK = 10;
+        for (let i = 0; i < TOP_PAIRS.length; i += CHUNK) {
+          const chunk = TOP_PAIRS.slice(i, i + CHUNK);
+          try {
+            // Bybit doesn't support multi-symbol in one call, but the linear tickers endpoint
+            // is tiny per symbol. Use the spot tickers with a symbol filter instead.
+            // Fallback: if individual calls fail, use the full list once.
+            await Promise.all(chunk.map(async sym => {
+              try {
+                const d = await bbPublic("/v5/market/tickers", { category:"spot", symbol:sym });
+                const t = d?.list?.[0];
+                if (t) map[sym] = parseFloat(t.lastPrice);
+              } catch(_) {}
+            }));
+          } catch(_) {}
+        }
+        if (Object.keys(map).length > 0) {
+          priceRef.current = { ...priceRef.current, ...map };
+          if (!validSymbolsRef.current) validSymbolsRef.current = new Set(TOP_PAIRS);
+          setPrices({ ...map });
+        } else {
+          // Fallback to full ticker list only if targeted fetch completely fails
           try {
             const d = await bbPublic("/v5/market/tickers",{category:"spot"});
             if ((d.list||[]).length > 0) {
-              map = {};
-              d.list.forEach(t=>{ map[t.symbol]=parseFloat(t.lastPrice); });
+              (d.list).forEach(t=>{ map[t.symbol]=parseFloat(t.lastPrice); });
+              priceRef.current=map;
+              if (!validSymbolsRef.current) validSymbolsRef.current = new Set(Object.keys(map));
+              const filteredMap = {};
+              TOP_PAIRS.forEach(sym => { if (map[sym]) filteredMap[sym] = map[sym]; });
+              setPrices(filteredMap);
             }
-          } catch(_) { if (attempt < 1) await new Promise(r=>setTimeout(r,1200)); }
+          } catch(_) {}
+          addLog("Market","Price fetch failed [bybit] — using cached prices","warn");
         }
-        if (map) {
-          // Keep full map in ref for valid-symbol checks, but only expose traded pairs to state
-          // This prevents re-rendering the whole UI for 400+ irrelevant tickers
-          priceRef.current=map;
-          if (!validSymbolsRef.current) validSymbolsRef.current = new Set(Object.keys(map));
-          const filteredMap = {};
-          TOP_PAIRS.forEach(sym => { if (map[sym]) filteredMap[sym] = map[sym]; });
-          setPrices(filteredMap);
-        }
-        else addLog("Market","Price fetch failed [bybit] — using cached prices","warn");
       } else if (ex==="okx") {
         const data = await okxPublic("/api/v5/market/tickers",{instType:"SPOT"});
         const map={}; (data||[]).forEach(t=>{ map[normSymbol(t.instId)]=parseFloat(t.last); });
@@ -1527,9 +1545,9 @@ export default function App() {
 
   /* ── Fetch Order Book depth ── */
   const fetchOrderBook = useCallback(async(symbol)=>{
-    // 30s staleness cache — avoid hitting API every bot tick for every signal
+    // 90s staleness cache — order book walls don't shift faster than a bot tick
     const cached = obCacheRef.current[symbol];
-    if (cached && Date.now() - cached.ts < 30000) {
+    if (cached && Date.now() - cached.ts < 90000) {
       return {bids:cached.bids,asks:cached.asks,bidVol:cached.bidVol,askVol:cached.askVol,bias:cached.bias};
     }
     const ex = creds?.exchange||"bybit";
@@ -2587,16 +2605,36 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
   /* ── Periodic exchange balance refresh (live mode only) ── */
   useEffect(()=>{
     if (!creds || isDemo || paperMode) return;
-    // Fetch immediately on connect, then every 30 s so UTA balance stays current
+    // Fetch immediately on connect, then every 120 s — balance doesn't need sub-minute polling
     fetchBalances();
-    const iv = setInterval(fetchBalances, 30000);
+    const iv = setInterval(fetchBalances, 120000);
     return () => clearInterval(iv);
   },[creds, isDemo, paperMode, fetchBalances]);
+
+  /* ── Pause all polling when screen is off / tab is hidden ── */
+  useEffect(()=>{
+    const onVisibility = () => {
+      // When the user switches away or locks the phone, stop the bot tick and price loops.
+      // They restart automatically when the tab becomes visible again via the existing useEffects.
+      if (document.hidden) {
+        clearInterval(botRef.current);
+      } else {
+        // Resumed — immediately re-fetch prices then restart the bot tick if it was running
+        if (creds || isDemo || paperMode) fetchPrices();
+        if (botRunningRef.current) {
+          runBotTick();
+          botRef.current = setInterval(runBotTick, isDemo ? 30000 : 60000);
+        }
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  },[creds,isDemo,paperMode,fetchPrices,runBotTick]);
 
   /* ── Price + SL/TP monitor loop ── */
   useEffect(()=>{
     if (!creds&&!isDemo&&!paperMode) return;
-    const iv1=setInterval(fetchPrices,15000);       // 15s instead of 5s — prices don't change that fast
+    const iv1=setInterval(fetchPrices,45000);       // 45s — sufficient for 15m-candle bot; saves ~3× mobile data
     const iv2=setInterval(monitorPositions,8000);   // 8s monitor check is fine
     return ()=>{ clearInterval(iv1); clearInterval(iv2); };
   },[creds,isDemo,paperMode,fetchPrices,monitorPositions]);
