@@ -2076,8 +2076,8 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
         setTrades(prev=>[{...existing,closePrice:price,pnl:pnlPct,closeTs:new Date(),result:pnlPct>0?"TP":"CLOSED"},...prev.slice(0,199)]);
         setOpenPos(prev=>prev.filter(p=>p.id!==existing.id));
         if(paperMode||isDemo){
-          const dollarPnl=(pnlPct/100)*(existing.qty*existing.entry);
-          const originalCapital = existing.qty * existing.entry;
+          const originalCapital = existing.capitalUsed || (existing.qty * existing.entry);  // use exact deducted amount
+          const dollarPnl=(pnlPct/100)*originalCapital;
           const totalReturn = originalCapital + dollarPnl;  // return capital + profit/loss
           const updatedBals = balancesRef.current.map(b=>
             b.asset==="USDT"?{...b,free:String((parseFloat(b.free)+totalReturn).toFixed(2))}:b
@@ -2163,6 +2163,7 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
         }
         const pos={
           id:Date.now()+Math.random(), symbol, side:sig.action, entry:price, qty,
+          capitalUsed: safeAmt,  // exact USDT deducted — used for accurate capital return on close
           sl, tp, slPct, tpPct, confidence:sig.confidence, reasons:sig.reasons,
           patterns:sig.meta?.patterns?.filter(p=>p.type!=="neutral").map(p=>p.name)||[],
           regime:sig.meta?.regime, adx:sig.meta?.adx, volRatio:sig.meta?.volRatio,
@@ -2251,13 +2252,11 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
           setTrades(prev=>[{...pos,closePrice:price,pnl:pnlPct,closeTs:new Date(),result},...prev.slice(0,199)]);
           setOpenPos(prev=>prev.filter(p=>p.id!==pos.id));
 
-          const originalCapital = pos.qty * pos.entry;
+          const originalCapital = pos.capitalUsed || (pos.qty * pos.entry);  // use exact deducted amount
           const dollarPnl = (pnlPct/100) * originalCapital;
 
           if(paperMode||isDemo){
-            // ── FIX: return original capital + PnL, not just PnL ──
             const totalReturn = originalCapital + dollarPnl;
-            // ── FIX: update balancesRef immediately so the very next tick reads fresh balance ──
             const updatedBals = balancesRef.current.map(b=>
               b.asset==="USDT"
                 ?{...b,free:String((parseFloat(b.free)+totalReturn).toFixed(2))}
@@ -4366,9 +4365,10 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
                   const pnlPct = pos.side==="BUY"
                     ?(price-pos.entry)/pos.entry*100
                     :(pos.entry-price)/pos.entry*100;
-                  const dollarPnl = (pnlPct/100)*(pos.qty*pos.entry);
+                  const capital = pos.capitalUsed || (pos.qty*pos.entry);
+                  const dollarPnl = (pnlPct/100)*capital;
                   totalDollarPnl += dollarPnl;
-                  totalCapitalReturned += pos.qty*pos.entry;
+                  totalCapitalReturned += capital;
                   closedNow.push({...pos,closePrice:price,pnl:pnlPct,closeTs:new Date(),result:"STOPPED"});
                   addLog("Bot",`Force-closed ${pos.symbol} on STOP — PnL: ${fmtP(pnlPct)}`,pnlPct>=0?"ok":"warn");
                 });
