@@ -1072,16 +1072,16 @@ export default function App() {
   }, []); // eslint-disable-line
   const [cfg,        setCfg]        = useState({
     pairs:     TOP_PAIRS,
-    amount:    "50",
-    stopLoss:  "2",      // fallback % if ATR unavailable
+    amount:    "50",      // USDT per individual trade
+    stopLoss:  "2",       // fallback % if ATR unavailable
     takeProfit:"4",
     interval:  "15m",
     minConfidence: "62",
-    useAtrSl:  true,     // use ATR-based SL/TP when available
-    trailingPct: "1.5",  // trailing stop % (0 = disabled)
-    maxPositions: "5",   // max concurrent open positions = numCoins
-    totalBudget:  "10",  // total USDT to allocate across all coins
-    numCoins:     "5",   // how many coins to spread budget across
+    useAtrSl:  true,      // use ATR-based SL/TP when available
+    trailingPct: "1.5",   // trailing stop % (0 = disabled)
+    maxPositions: "20",   // hard cap on concurrent positions
+    totalBudget:  "300",  // max USDT to deploy across ALL open positions
+    numCoins:     "6",    // auto-derived: floor(totalBudget / amount)
   });
 
   /* ── Wallet state ── */
@@ -1094,8 +1094,9 @@ export default function App() {
   const [showStopModal, setShowStopModal] = useState(false); // Stop trading summary modal
   const [showStartModal,setShowStartModal]= useState(false); // Live start confirmation modal
   const [liveTradeAmt,  setLiveTradeAmt]  = useState("");    // per-coin amount (auto-computed)
-  const [liveTotalBudget,setLiveTotalBudget]=useState("10");  // total USDT to spend this session
-  const [liveNumCoins,  setLiveNumCoins]  = useState("5");   // how many coins to spread across
+  const [liveTotalBudget,setLiveTotalBudget]=useState("300"); // total USDT cap for this session
+  const [livePerTradeAmt,setLivePerTradeAmt]=useState("50");  // USDT per individual position
+  const [liveNumCoins,  setLiveNumCoins]  = useState("6");   // auto-derived: floor(totalBudget/perTrade)
   const [stopBalance,   setStopBalance]   = useState("");    // stop bot if USDT drops below this
   const [wdForm,        setWdForm]        = useState({ coin:"USDT", network:"BSC", address:"", amount:"" });
   const [wdStatus,      setWdStatus]      = useState(null);  // { type, msg }
@@ -1120,6 +1121,8 @@ export default function App() {
 
   /* ── New feature state ── */
   const trailingStops  = useRef({});          // { [posId]: { highWater, lowWater } }
+  const userStoppedRef = useRef(false);       // true = user manually stopped → bot must NOT re-open positions
+  const closingPositionsRef = useRef(new Set()); // close-guard: prevents double-sell race between monitor & stop handler
   const obCacheRef     = useRef({});          // { [symbol]: {bids,asks,bidVol,askVol,bias,ts} }
   const scanBatchRef   = useRef(0);           // rotating batch index for pair scanning          // { [symbol]: {bids,asks,bidVol,askVol,bias,ts} }
   const [btResult,     setBtResult]     = useState(null);
@@ -1936,10 +1939,19 @@ Respond in JSON only: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","short_reason":"ma
 
     addLog("Scanner",`[${isDemo?"DEMO":"LIVE"}] Scanning batch ${batchPairs.length}/${total} pairs (offset ${batchStart}) · Min conf ${cfg.minConfidence}%`,"info");
 
-    // ── Gate: don't open more positions than numCoins (budget slots) ──
-    const maxPos = Math.max(1, parseInt(cfg.numCoins || cfg.maxPositions || "5"));
-    if (posRef.current.length >= maxPos) {
-      addLog("Scanner",`All ${maxPos} coin slots filled — waiting for exits`,"warn");
+    // ── Compute maxPos from totalBudget ÷ perTradeAmt (with hard-cap from cfg.maxPositions) ──
+    const _perTrade   = Math.max(0.5, parseFloat(cfg.amount)       || 50);
+    const _totalBudget= Math.max(_perTrade, parseFloat(cfg.totalBudget) || (_perTrade * 10));
+    const _budgetSlots= Math.floor(_totalBudget / _perTrade);          // how many trades fit in budget
+    const maxPos = Math.min(
+      Math.max(1, parseInt(cfg.maxPositions || cfg.numCoins || "20")),
+      Math.max(1, _budgetSlots)
+    );
+
+    // Deployed capital = open positions × perTradeAmt (optimistic — prevents over-spending)
+    const deployedCapital = posRef.current.length * _perTrade;
+    if (posRef.current.length >= maxPos || deployedCapital >= _totalBudget * 0.99) {
+      addLog("Scanner",`Budget slots full — ${posRef.current.length}/${maxPos} positions · $${deployedCapital.toFixed(0)}/$${_totalBudget.toFixed(0)} deployed — waiting for exits`,"info");
       return;
     }
 
@@ -2079,10 +2091,17 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
 
       /* Open new position */
       if (!existing||(existing&&existing.side!==sig.action)) {
-        // ── Hard limit: 1 new position per tick, spread across scans ──
-        if (openedThisTick >= 1) {
-          addLog("Bot",`${symbol} signal skipped — already opened 1 position this tick (protects balance)`,"info");
-          continue;
+        // ── Allow multiple opens per tick — fill all available budget slots ──
+        const currentTotal = posRef.current.length + openedThisTick;
+        if (currentTotal >= maxPos) {
+          addLog("Bot",`All ${maxPos} slots filled this tick — done scanning`,"info");
+          break;
+        }
+        // ── Budget guard: deployed + this trade must not exceed totalBudget ──
+        const deployedNow = currentTotal * _perTrade;
+        if (deployedNow + _perTrade > _totalBudget * 1.02) {
+          addLog("Bot",`Budget cap — $${deployedNow.toFixed(2)} of $${_totalBudget.toFixed(2)} deployed`,"warn");
+          break;
         }
         // ── Stop guard: don't open if bot was stopped while this tick was running ──
         if (!botRunningRef.current) {
@@ -2099,25 +2118,22 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
           break;
         }
 
-        // ── Per-coin amount = totalBudget ÷ numCoins ──
-        // e.g. $10 budget ÷ 5 coins = $2 per coin
-        const totalBudget = parseFloat(cfg.totalBudget)||parseFloat(cfg.amount)||5;
-        const numCoins    = Math.max(1, parseInt(cfg.numCoins)||5);
-        const perCoinAmt  = +(totalBudget / numCoins).toFixed(4);
+        // ── Per-trade amount = cfg.amount; total budget cap = cfg.totalBudget ──
+        const perTradeAmt = _perTrade;   // already computed above (cfg.amount)
 
-        // Count how many coin slots are already filled
-        const alreadyOpen = posRef.current.length;
-        if (alreadyOpen >= numCoins) {
-          addLog("Bot",`All ${numCoins} coin slots filled — waiting for exits`,"info");
+        // Count how many coin slots are already filled (including opens this tick)
+        const alreadyOpen = posRef.current.length + openedThisTick;
+        if (alreadyOpen >= maxPos) {
+          addLog("Bot",`All ${maxPos} coin slots filled — waiting for exits`,"info");
           break;
         }
 
-        // Only skip if balance can't even cover one coin's slot
-        if (usdtBal * 0.98 < perCoinAmt) {
-          addLog("Bot",`Skipping ${symbol} — need $${perCoinAmt.toFixed(2)}/coin, have $${usdtBal.toFixed(2)} USDT`,"warn");
+        // Only skip if balance can't even cover one trade
+        if (usdtBal * 0.98 < perTradeAmt) {
+          addLog("Bot",`Skipping ${symbol} — need $${perTradeAmt.toFixed(2)}/trade, have $${usdtBal.toFixed(2)} USDT`,"warn");
           continue;
         }
-        const safeAmt = perCoinAmt;
+        const safeAmt = perTradeAmt;
         const orderQty = +(safeAmt/price).toFixed(6);
         const TAKER_FEE = 0.001;
         const qty = +(orderQty * (1 - TAKER_FEE)).toFixed(6);
@@ -2164,8 +2180,14 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
 
   /* ── SL/TP Monitor + Trailing Stops ── */
   const monitorPositions = useCallback(()=>{
+    // ── User-stopped guard: user manually stopped — do NOT auto-close (already handled by stop modal) ──
+    if (userStoppedRef.current) return;
+
     const trailPct = parseFloat(cfg.trailingPct)||0;
     posRef.current.forEach(async pos=>{
+      // ── Close guard: skip if this position is already being closed (prevents double-sell race) ──
+      if (closingPositionsRef.current.has(pos.id)) return;
+
       const price=priceRef.current[pos.symbol];
       if (!price) return;
       const pnlPct=pos.side==="BUY"
@@ -2204,39 +2226,65 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
       const hitSL=pos.side==="BUY"?price<=effectiveSL:price>=effectiveSL;
       const hitTP=pos.side==="BUY"?price>=pos.tp:price<=pos.tp;
       if (hitSL||hitTP) {
-        delete trailingStops.current[pos.id];
-        const closeSide=pos.side==="BUY"?"SELL":"BUY";
-        // For live Bybit BUY positions: use actual wallet balance, not stored qty.
-        // Exchange deducts a fee on buy so pos.qty is always slightly more than
-        // what actually landed — sending pos.qty causes "insufficient balance" rejection.
-        let sellQty = pos.qty;
-        if (!paperMode && !isDemo && closeSide === "SELL") {
-          const base = pos.symbol.endsWith("USDT") ? pos.symbol.slice(0,-4)
-                     : pos.symbol.endsWith("USDC") ? pos.symbol.slice(0,-4)
-                     : pos.symbol.slice(0,-4);
-          const actualFree = parseFloat(balancesRef.current.find(b=>b.asset===base)?.free||"0");
-          if (actualFree > 0) {
-            sellQty = actualFree; // use real balance — guaranteed to match exchange
-            addLog("Executor",`[sell] ${pos.symbol}: using actual balance ${actualFree.toFixed(6)} instead of stored qty ${pos.qty}`,"info");
+        // ── Claim this position before async work — prevents double-sell race ──
+        closingPositionsRef.current.add(pos.id);
+        try {
+          delete trailingStops.current[pos.id];
+          const closeSide=pos.side==="BUY"?"SELL":"BUY";
+          // For live BUY positions: use actual wallet balance (exchange deducts fees on buy,
+          // so pos.qty > what actually landed — sending pos.qty causes "insufficient balance").
+          let sellQty = pos.qty;
+          if (!paperMode && !isDemo && closeSide === "SELL") {
+            const base = pos.symbol.endsWith("USDT") ? pos.symbol.slice(0,-4)
+                       : pos.symbol.endsWith("USDC") ? pos.symbol.slice(0,-4)
+                       : pos.symbol.slice(0,-4);
+            const actualFree = parseFloat(balancesRef.current.find(b=>b.asset===base)?.free||"0");
+            if (actualFree > 0) {
+              sellQty = actualFree;
+              addLog("Executor",`[SELL] ${pos.symbol}: using wallet balance ${actualFree.toFixed(6)} (stored qty ${pos.qty})`,"info");
+            }
           }
+          await placeOrder(pos.symbol,closeSide,sellQty);
+          const isTrail = trailPct>0 && hitSL && pnlPct>0;
+          const result=hitTP?"TP":isTrail?"TRAIL":"SL";
+          setTrades(prev=>[{...pos,closePrice:price,pnl:pnlPct,closeTs:new Date(),result},...prev.slice(0,199)]);
+          setOpenPos(prev=>prev.filter(p=>p.id!==pos.id));
+
+          const originalCapital = pos.qty * pos.entry;
+          const dollarPnl = (pnlPct/100) * originalCapital;
+
+          if(paperMode||isDemo){
+            // ── FIX: return original capital + PnL, not just PnL ──
+            const totalReturn = originalCapital + dollarPnl;
+            // ── FIX: update balancesRef immediately so the very next tick reads fresh balance ──
+            const updatedBals = balancesRef.current.map(b=>
+              b.asset==="USDT"
+                ?{...b,free:String((parseFloat(b.free)+totalReturn).toFixed(2))}
+                :b
+            );
+            balancesRef.current = updatedBals;
+            setBalances(updatedBals);
+            addLog("Balance",
+              `${pos.symbol} ${result} @ $${priceFmt(price)} — Capital $${originalCapital.toFixed(2)} + PnL ${dollarPnl>=0?"+$":"-$"}${Math.abs(dollarPnl).toFixed(4)} → USDT balance updated`,
+              hitTP||isTrail?"ok":"warn"
+            );
+          } else {
+            // Live: sell already placed above — double-refresh so UTA USDT reflects settlement
+            setTimeout(()=>fetchBalances(), 3000);
+            setTimeout(()=>fetchBalances(), 7000);
+            addLog("Balance",
+              `${pos.symbol} ${result} @ $${priceFmt(price)} — PnL ${dollarPnl>=0?"+$":"-$"}${Math.abs(dollarPnl).toFixed(4)} — proceeds returning to UTA`,
+              hitTP||isTrail?"ok":"warn"
+            );
+          }
+          addLog("Risk",
+            `${pos.symbol} AUTO-CLOSED (${result}) @ $${priceFmt(price)} — PnL: ${fmtP(pnlPct)} — bot will re-open next tick`,
+            hitTP||isTrail?"ok":"warn"
+          );
+        } finally {
+          // Always release the guard — never leave a position permanently locked
+          closingPositionsRef.current.delete(pos.id);
         }
-        await placeOrder(pos.symbol,closeSide,sellQty);
-        const isTrail = trailPct>0 && hitSL && pnlPct>0;
-        const result=hitTP?"TP":isTrail?"TRAIL":"SL";
-        setTrades(prev=>[{...pos,closePrice:price,pnl:pnlPct,closeTs:new Date(),result},...prev.slice(0,199)]);
-        setOpenPos(prev=>prev.filter(p=>p.id!==pos.id));
-        if(paperMode||isDemo){
-          const dollarPnl=(pnlPct/100)*(pos.qty*pos.entry);
-          setBalances(prev=>prev.map(b=>b.asset==="USDT"?{...b,free:String((parseFloat(b.free)+dollarPnl).toFixed(2))}:b));
-        } else {
-          // Live: place the sell first (done above), then double-refresh so UTA USDT
-          // balance reflects the returned proceeds after exchange settlement.
-          const dollarPnl=(pnlPct/100)*(pos.qty*pos.entry);
-          setTimeout(()=>fetchBalances(), 3000);   // first refresh after ~3 s
-          setTimeout(()=>fetchBalances(), 7000);   // second refresh in case first was early
-          addLog("Balance",`${pos.symbol} ${result} closed: ${pnlPct>=0?"+$"+Math.abs(dollarPnl).toFixed(4):"-$"+Math.abs(dollarPnl).toFixed(4)} — USDT returning to UTA`,"ok");
-        }
-        addLog("Risk",`${pos.symbol} hit ${result} @ $${priceFmt(price)} — PnL: ${fmtP(pnlPct)}`,hitTP||isTrail?"ok":"warn");
       }
     });
   },[cfg.trailingPct,placeOrder,addLog,fetchBalances,paperMode,isDemo]);
@@ -3313,8 +3361,9 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
               {/* Settings grid */}
               <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,marginBottom:20}}>
                 {[
+                  ["TOTAL BUDGET (USDT)","totalBudget","300"],
                   ["AMOUNT PER TRADE (USDT)","amount","50"],
-                  ["MAX OPEN POSITIONS","maxPositions","3"],
+                  ["MAX OPEN POSITIONS","maxPositions","6"],
                   ["FALLBACK STOP LOSS %","stopLoss","2"],
                   ["FALLBACK TAKE PROFIT %","takeProfit","4"],
                   ["MIN. SIGNAL CONFIDENCE %","minConfidence","62"],
@@ -3324,7 +3373,18 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
                     <div style={{fontFamily:"Orbitron",fontSize:7.5,letterSpacing:2,
                       color:"rgba(0,245,196,.5)",marginBottom:7}}>{label}</div>
                     <input className="inp2" placeholder={ph} value={cfg[key]}
-                      onChange={e=>setCfg(c=>({...c,[key]:e.target.value}))}/>
+                      onChange={e=>{
+                        const v=e.target.value;
+                        if (key==="totalBudget"||key==="amount") {
+                          // auto-derive maxPositions when budget or perTrade changes
+                          const budget = key==="totalBudget" ? parseFloat(v)||0 : parseFloat(cfg.totalBudget)||300;
+                          const per    = key==="amount"       ? parseFloat(v)||0 : parseFloat(cfg.amount)||50;
+                          const slots  = Math.max(1, Math.floor(budget/Math.max(0.01,per)));
+                          setCfg(c=>({...c,[key]:v,numCoins:String(slots),maxPositions:String(slots)}));
+                        } else {
+                          setCfg(c=>({...c,[key]:v}));
+                        }
+                      }}/>
                   </div>
                 ))}
                 <div>
@@ -3754,29 +3814,62 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
           </span>
         </div>
 
-        {/* Trade amount quick-set (shown when bot is NOT running) */}
+        {/* Trade amount / budget quick-set (shown when bot is NOT running) */}
         {!botRunning&&(
           <div style={{background:"rgba(1,4,12,.97)",border:"1px solid rgba(0,245,196,.25)",
-            borderRadius:6,padding:"8px 10px",display:"flex",flexDirection:"column",gap:4,minWidth:150}}>
-            <div style={{display:"flex",alignItems:"center",gap:6}}>
-              <span style={{fontFamily:"Orbitron",fontSize:9,color:"rgba(0,245,196,.5)",flexShrink:0}}>$</span>
-              <input
-                type="number" min="0.5" step="0.5"
-                placeholder={cfg.amount||"5"}
-                value={cfg.amount}
-                onChange={e=>{
-                  const v = e.target.value;
-                  amtRef.current = v;
-                  setCfg(c=>({...c,amount:v}));
-                }}
-                style={{flex:1,background:"transparent",border:"none",outline:"none",
-                  fontFamily:"Orbitron",fontWeight:700,fontSize:13,color:"#00f5c4",
-                  width:0,minWidth:0}}
-              />
-              <span style={{fontFamily:"Orbitron",fontSize:7,color:"rgba(0,245,196,.3)",letterSpacing:1}}>PER TRADE</span>
+            borderRadius:6,padding:"10px 12px",display:"flex",flexDirection:"column",gap:6,minWidth:180}}>
+            {/* Per-trade amount */}
+            <div>
+              <div style={{fontFamily:"Orbitron",fontSize:7,color:"rgba(0,245,196,.4)",letterSpacing:1,marginBottom:3}}>$ PER TRADE</div>
+              <div style={{display:"flex",alignItems:"center",gap:4}}>
+                <span style={{fontFamily:"Orbitron",fontSize:9,color:"rgba(0,245,196,.5)",flexShrink:0}}>$</span>
+                <input
+                  type="number" min="0.5" step="0.5"
+                  placeholder={cfg.amount||"50"}
+                  value={cfg.amount}
+                  onChange={e=>{
+                    const v=e.target.value;
+                    amtRef.current=v;
+                    const slots=Math.max(1,Math.floor((parseFloat(cfg.totalBudget)||300)/Math.max(0.01,parseFloat(v)||50)));
+                    setCfg(c=>({...c,amount:v,numCoins:String(slots),maxPositions:String(slots)}));
+                  }}
+                  style={{flex:1,background:"transparent",border:"none",outline:"none",
+                    fontFamily:"Orbitron",fontWeight:700,fontSize:13,color:"#00f5c4",width:0,minWidth:0}}
+                />
+              </div>
             </div>
+            {/* Total budget */}
+            <div>
+              <div style={{fontFamily:"Orbitron",fontSize:7,color:"rgba(0,245,196,.4)",letterSpacing:1,marginBottom:3}}>TOTAL BUDGET</div>
+              <div style={{display:"flex",alignItems:"center",gap:4}}>
+                <span style={{fontFamily:"Orbitron",fontSize:9,color:"rgba(0,245,196,.5)",flexShrink:0}}>$</span>
+                <input
+                  type="number" min="1" step="1"
+                  placeholder={cfg.totalBudget||"300"}
+                  value={cfg.totalBudget}
+                  onChange={e=>{
+                    const v=e.target.value;
+                    const slots=Math.max(1,Math.floor((parseFloat(v)||300)/Math.max(0.01,parseFloat(cfg.amount)||50)));
+                    setCfg(c=>({...c,totalBudget:v,numCoins:String(slots),maxPositions:String(slots)}));
+                  }}
+                  style={{flex:1,background:"transparent",border:"none",outline:"none",
+                    fontFamily:"Orbitron",fontWeight:700,fontSize:13,color:"#00f5c4",width:0,minWidth:0}}
+                />
+              </div>
+            </div>
+            {/* Auto-derived max positions */}
+            {(()=>{
+              const slots=Math.max(1,Math.floor((parseFloat(cfg.totalBudget)||300)/Math.max(0.01,parseFloat(cfg.amount)||50)));
+              return(
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",
+                  borderTop:"1px solid rgba(0,245,196,.1)",paddingTop:5}}>
+                  <span style={{fontFamily:"Orbitron",fontSize:7,color:"rgba(0,245,196,.4)",letterSpacing:1}}>MAX POSITIONS</span>
+                  <span style={{fontFamily:"Orbitron",fontWeight:700,fontSize:11,color:"#00f5c4"}}>{slots}</span>
+                </div>
+              );
+            })()}
             {/* Pairs counter */}
-            <div style={{fontFamily:"Orbitron",fontSize:7,color:"rgba(0,245,196,.4)",
+            <div style={{fontFamily:"Orbitron",fontSize:7,color:"rgba(0,245,196,.35)",
               letterSpacing:1,textAlign:"right"}}>
               {eligiblePairs.length}/{TOP_PAIRS.length} PAIRS
             </div>
@@ -3793,6 +3886,7 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
               setLiveTradeAmt(cfg.amount||"5");
               setShowStartModal(true);
             } else {
+              userStoppedRef.current = false; // reset so bot re-opens after SL/TP
               setBotRunning(true);
             }
           }}
@@ -3841,9 +3935,13 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
                   <span style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",
                     fontFamily:"Orbitron",fontSize:13,color:"rgba(0,245,196,.5)",pointerEvents:"none"}}>$</span>
                   <input type="number" min="1" step="1" autoFocus
-                    placeholder="10"
+                    placeholder="300"
                     value={liveTotalBudget}
-                    onChange={e=>setLiveTotalBudget(e.target.value)}
+                    onChange={e=>{
+                      setLiveTotalBudget(e.target.value);
+                      const slots=Math.floor((parseFloat(e.target.value)||0)/Math.max(0.01,parseFloat(livePerTradeAmt)||50));
+                      setLiveNumCoins(String(Math.max(1,slots)));
+                    }}
                     style={{paddingLeft:26,width:"100%",background:"rgba(0,245,196,.05)",
                       border:"1px solid rgba(0,245,196,.3)",color:"#00f5c4",
                       fontFamily:"Orbitron",fontWeight:700,fontSize:16,
@@ -3852,8 +3950,12 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
                 </div>
               </div>
               <div style={{display:"flex",gap:6,marginTop:6}}>
-                {["5","10","20","50","100"].map(v=>(
-                  <button key={v} onClick={()=>setLiveTotalBudget(v)}
+                {["50","100","200","300","500","1000"].map(v=>(
+                  <button key={v} onClick={()=>{
+                    setLiveTotalBudget(v);
+                    const slots=Math.floor((parseFloat(v)||0)/Math.max(0.01,parseFloat(livePerTradeAmt)||50));
+                    setLiveNumCoins(String(Math.max(1,slots)));
+                  }}
                     style={{fontFamily:"Orbitron",fontSize:8,padding:"4px 8px",cursor:"pointer",
                       borderRadius:3,border:"1px solid rgba(0,245,196,.25)",
                       background:liveTotalBudget===v?"rgba(0,245,196,.15)":"transparent",
@@ -3864,28 +3966,57 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
               </div>
             </div>
 
-            {/* ── NUMBER OF COINS ── */}
+            {/* ── PER TRADE AMOUNT ── */}
             <div style={{marginBottom:14}}>
               <div style={{fontFamily:"Orbitron",fontSize:8,letterSpacing:2,
-                color:"rgba(0,245,196,.6)",marginBottom:6}}>SPREAD ACROSS HOW MANY COINS</div>
-              <div style={{display:"flex",gap:6}}>
-                {["2","3","4","5","6","8","10"].map(v=>(
-                  <button key={v} onClick={()=>setLiveNumCoins(v)}
-                    style={{fontFamily:"Orbitron",fontSize:9,padding:"7px 10px",cursor:"pointer",
-                      borderRadius:3,border:"1px solid rgba(0,245,196,.25)",flex:1,
-                      background:liveNumCoins===v?"rgba(0,245,196,.15)":"transparent",
-                      color:liveNumCoins===v?"#00f5c4":"rgba(0,245,196,.45)"}}>
-                    {v}
+                color:"rgba(0,245,196,.6)",marginBottom:6}}>USDT PER OPEN TRADE</div>
+              <div style={{display:"flex",alignItems:"center",gap:8}}>
+                <div style={{position:"relative",flex:1}}>
+                  <span style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",
+                    fontFamily:"Orbitron",fontSize:13,color:"rgba(0,245,196,.5)",pointerEvents:"none"}}>$</span>
+                  <input type="number" min="1" step="1"
+                    placeholder="50"
+                    value={livePerTradeAmt}
+                    onChange={e=>{
+                      setLivePerTradeAmt(e.target.value);
+                      const slots=Math.floor((parseFloat(liveTotalBudget)||0)/Math.max(0.01,parseFloat(e.target.value)||1));
+                      setLiveNumCoins(String(Math.max(1,slots)));
+                    }}
+                    style={{paddingLeft:26,width:"100%",background:"rgba(0,245,196,.05)",
+                      border:"1px solid rgba(0,245,196,.3)",color:"#00f5c4",
+                      fontFamily:"Orbitron",fontWeight:700,fontSize:16,
+                      padding:"10px 10px 10px 26px",borderRadius:3,outline:"none"}}
+                  />
+                </div>
+              </div>
+              <div style={{display:"flex",gap:6,marginTop:6}}>
+                {["5","10","25","50","100","200"].map(v=>(
+                  <button key={v} onClick={()=>{
+                    setLivePerTradeAmt(v);
+                    const slots=Math.floor((parseFloat(liveTotalBudget)||0)/Math.max(0.01,parseFloat(v)));
+                    setLiveNumCoins(String(Math.max(1,slots)));
+                  }}
+                    style={{fontFamily:"Orbitron",fontSize:8,padding:"4px 8px",cursor:"pointer",
+                      borderRadius:3,border:"1px solid rgba(0,245,196,.25)",
+                      background:livePerTradeAmt===v?"rgba(0,245,196,.15)":"transparent",
+                      color:livePerTradeAmt===v?"#00f5c4":"rgba(0,245,196,.45)"}}>
+                    ${v}
                   </button>
                 ))}
               </div>
-              {liveTotalBudget&&liveNumCoins&&(
-                <div style={{marginTop:7,fontFamily:"Orbitron",fontSize:8,color:"rgba(0,245,196,.55)",
-                  background:"rgba(0,245,196,.04)",border:"1px solid rgba(0,245,196,.12)",
-                  borderRadius:3,padding:"6px 10px"}}>
-                  = ${(parseFloat(liveTotalBudget||0)/Math.max(1,parseInt(liveNumCoins||1))).toFixed(2)} per coin
-                </div>
-              )}
+              {/* Auto-computed max positions */}
+              {liveTotalBudget&&livePerTradeAmt&&(()=>{
+                const slots=Math.floor((parseFloat(liveTotalBudget)||0)/Math.max(0.01,parseFloat(livePerTradeAmt)||1));
+                return slots>0?(
+                  <div style={{marginTop:7,fontFamily:"Orbitron",fontSize:8,
+                    color:"rgba(0,245,196,.7)",background:"rgba(0,245,196,.06)",
+                    border:"1px solid rgba(0,245,196,.2)",borderRadius:3,padding:"7px 10px",
+                    display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <span>MAX OPEN POSITIONS</span>
+                    <span style={{fontSize:15,fontWeight:700,color:"#00f5c4"}}>{slots}</span>
+                  </div>
+                ):null;
+              })()}
             </div>
 
             {/* ── STOP BALANCE ── */}
@@ -3944,28 +4075,29 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
             </div>
 
             <div style={{fontSize:9,color:"rgba(160,180,210,.5)",lineHeight:1.7,marginBottom:18}}>
-              Bot uses your total budget divided equally across coins.
-              E.g. $10 budget ÷ 5 coins = $2 per coin. It will never open more than the chosen number
-              of positions at once. Set a stop balance to protect the rest of your funds.
+              The bot spreads your total budget in equal chunks of your chosen per-trade amount.
+              E.g. $300 budget ÷ $50/trade = 6 simultaneous positions. It will never pack the whole
+              budget into one trade. Set a stop balance to protect remaining funds.
             </div>
 
             <div style={{display:"flex",gap:10}}>
               <button
                 onClick={()=>{
-                  const budget   = liveTotalBudget||"10";
-                  const nCoins   = liveNumCoins||"5";
-                  const perCoin  = (parseFloat(budget)/Math.max(1,parseInt(nCoins))).toFixed(2);
+                  const budget     = liveTotalBudget || "300";
+                  const perTrade   = livePerTradeAmt  || "50";
+                  const slots      = Math.max(1, Math.floor((parseFloat(budget)||300) / Math.max(0.01,parseFloat(perTrade)||50)));
                   setCfg(c=>({...c,
-                    totalBudget: budget,
-                    numCoins:    nCoins,
-                    maxPositions:nCoins,
-                    amount:      perCoin,  // keep cfg.amount in sync for display
+                    totalBudget:  budget,
+                    amount:       perTrade,   // per-trade amount
+                    numCoins:     String(slots),
+                    maxPositions: String(slots),
                   }));
                   setShowStartModal(false);
                   fetchBalances();
                   fetchLiveOpenOrders();
+                  userStoppedRef.current = false; // reset so bot re-opens after SL/TP
                   setBotRunning(true);
-                  addLog("System",`▶ Live trading started — $${budget} budget ÷ ${nCoins} coins = $${perCoin}/coin on ${(creds?.exchange||"").toUpperCase()}`,"ok");
+                  addLog("System",`▶ Live trading started — $${budget} budget · $${perTrade}/trade · max ${slots} positions on ${(creds?.exchange||"").toUpperCase()}`,"ok");
                   if (stopBalance) addLog("System",`⛔ Stop balance set at $${stopBalance} USDT`,"warn");
                 }}
                 style={{flex:1,fontFamily:"Orbitron",fontWeight:900,fontSize:11,letterSpacing:2,
@@ -4222,6 +4354,7 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
 
               {/* ── OPTION 1: Stop and add profit to balance (ALL modes) ── */}
               <button onClick={async ()=>{
+                userStoppedRef.current = true;  // prevent monitor from re-processing cleared positions
                 setBotRunning(false); // stop the bot tick immediately
                 const currentPrices = priceRef.current;
                 let totalDollarPnl = 0;
@@ -4299,6 +4432,7 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
 
               {/* ── OPTION 2: Stop and withdraw profit (ALL modes) ── */}
               <button onClick={async ()=>{
+                userStoppedRef.current = true;  // prevent monitor from re-processing cleared positions
                 setBotRunning(false); // stop the bot tick immediately
                 if (isDemo||paperMode) {
                   // Demo/paper: credit balance then open wallet
@@ -4371,17 +4505,20 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
 
               {/* ── OPTION 3: Stop trading only — closes positions, no balance credit action ── */}
               <button onClick={async ()=>{
+                userStoppedRef.current = true;  // prevent monitor from re-processing cleared positions
                 setBotRunning(false); // stop the bot tick immediately
                 const posSnapshot = [...posRef.current];
                 const closedNow3 = [];
                 let totalDollarPnl3 = 0;
+                let totalCapitalReturned3 = 0;
 
                 if (paperMode || isDemo) {
-                  // Paper/demo: close from posRef
+                  // Paper/demo: close from posRef and return capital + PnL to balance
                   for (const pos of posSnapshot) {
                     const price = priceRef.current[pos.symbol] || pos.entry;
                     const pnlPct = pos.side==="BUY"?(price-pos.entry)/pos.entry*100:(pos.entry-price)/pos.entry*100;
                     totalDollarPnl3 += (pnlPct/100)*(pos.qty*pos.entry);
+                    totalCapitalReturned3 += pos.qty*pos.entry;
                     closedNow3.push({...pos,closePrice:price,pnl:pnlPct,closeTs:new Date(),result:"STOPPED"});
                     addLog("Bot",`Force-closed ${pos.symbol} on STOP — PnL: ${fmtP(pnlPct)}`,pnlPct>=0?"ok":"warn");
                   }
@@ -4408,6 +4545,20 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
                     setTimeout(()=>fetchBalances(), 3000);
                     setTimeout(()=>fetchBalances(), 8000);
                   }
+                }
+                // ── FIX: credit capital + PnL back to paper balance (was missing entirely) ──
+                if ((paperMode||isDemo) && closedNow3.length > 0) {
+                  const totalReturn3 = totalCapitalReturned3 + totalDollarPnl3;
+                  const updatedBals3 = balancesRef.current.map(b=>
+                    b.asset==="USDT"
+                      ?{...b,free:String((parseFloat(b.free)+totalReturn3).toFixed(2))}
+                      :b
+                  );
+                  balancesRef.current = updatedBals3;
+                  setBalances(updatedBals3);
+                  addLog("Bot",
+                    `${closedNow3.length} position${closedNow3.length!==1?"s":""} closed — Capital $${totalCapitalReturned3.toFixed(2)} + Net P&L ${totalDollarPnl3>=0?"+":""}$${totalDollarPnl3.toFixed(2)} returned to balance`,
+                    totalDollarPnl3>=0?"ok":"warn");
                 }
                 if (closedNow3.length > 0) {
                   setTrades(prev=>[...closedNow3,...prev.slice(0,199)]);
