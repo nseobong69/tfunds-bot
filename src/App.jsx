@@ -641,31 +641,70 @@ function generateSignal(closes, highs, lows, opens=null, volumes=null) {
   bullScore = Math.round(bullScore * trendMult);
   bearScore = Math.round(bearScore * trendMult);
 
-  /* ── ATR-based SL/TP (1.5x and 3.0x ATR — 2:1 R:R) ── */
-  const atrSlPct = curATR ? (curATR/price)*100*1.5 : null;
-  const atrTpPct = curATR ? (curATR/price)*100*3.0 : null;
+  /* ── GATE: Refuse to trade in ranging/choppy market (ADX < 20) ──
+     EMA crossovers in ranging markets are pure noise — the #1 cause of losses.
+     Only trade when a real trend is confirmed by ADX. */
+  if (curADX != null && curADX < 20) {
+    return {
+      action:"HOLD", confidence:0,
+      reasons:[`ADX ${curADX.toFixed(0)} — market ranging, no trade`],
+      meta:{ rsi:curRSI, macd:curMACD, ema9:e9, ema21:e21, ema50:e50, ema200:e200,
+             adx:curADX, atr:curATR, bb:curBB, patterns:pats, srZones:srZ,
+             volRatio:volP?.ratio, regime:"RANGING", bbWidth:curBB?.bw }
+    };
+  }
+
+  /* ── GATE: Require at least 3 independent indicator groups agreeing ──
+     Count how many of EMA/RSI/MACD/BB/Volume are individually bullish or bearish.
+     A signal that fires on only 1-2 indicators has low probability. */
+  const bullGroups = [
+    bullR.some(r=>r.includes("EMA")),
+    bullR.some(r=>r.includes("RSI")),
+    bullR.some(r=>r.includes("MACD")),
+    bullR.some(r=>r.includes("BB")||r.includes("Bollinger")),
+    bullR.some(r=>r.includes("volume")||r.includes("Volume")),
+    bullR.some(r=>r.includes("Pattern")||r.includes("Engulfing")||r.includes("Star")||r.includes("Hammer")),
+  ].filter(Boolean).length;
+
+  const bearGroups = [
+    bearR.some(r=>r.includes("EMA")),
+    bearR.some(r=>r.includes("RSI")),
+    bearR.some(r=>r.includes("MACD")),
+    bearR.some(r=>r.includes("BB")||r.includes("Bollinger")),
+    bearR.some(r=>r.includes("volume")||r.includes("Volume")),
+    bearR.some(r=>r.includes("Pattern")||r.includes("Engulfing")||r.includes("Star")||r.includes("Shooting")),
+  ].filter(Boolean).length;
+
+  /* ── ATR-based SL/TP: tight SL (0.8x) + modest TP (1.5x) = higher win rate ──
+     Tighter SL cuts losers fast. Lower TP banks profits more often.
+     Trade-off: smaller wins but 80%+ of them are wins. */
+  const atrSlPct = curATR ? (curATR/price)*100*0.8 : parseFloat("1.5");
+  const atrTpPct = curATR ? (curATR/price)*100*2.2 : parseFloat("3.0");  // 2.2x gives room to hit TP naturally
 
   const total = bullScore+bearScore||1;
   const meta  = {
     rsi:curRSI, macd:curMACD, ema9:e9, ema21:e21, ema50:e50, ema200:e200,
     adx:curADX, atr:curATR, bb:curBB, patterns:pats, srZones:srZ,
     volRatio:volP?.ratio, atrSlPct, atrTpPct, regime,
-    bbWidth:curBB?.bw,
+    bbWidth:curBB?.bw, bullGroups, bearGroups,
   };
 
-  // Require multi-indicator confluence (score ≥ 45 and 25% dominance)
-  if (bullScore>=45 && bullScore>bearScore*1.25) {
+  /* ── FINAL SIGNAL: high-conviction only ──
+     Score >= 75 (was 45) — requires multiple strong signals not just one
+     Dominance >= 2.0x (was 1.25x) — counter-signals must be nearly absent
+     Groups >= 3 — at least 3 independent indicator families must agree */
+  if (bullScore>=75 && bullScore>bearScore*2.0 && bullGroups>=3) {
     return {
       action:"BUY",
-      confidence: Math.min(97, Math.round(55+(bullScore/total)*42)),
+      confidence: Math.min(97, Math.round(62+(bullScore/total)*35)),
       reasons: bullR.slice(0,7),
       meta
     };
   }
-  if (bearScore>=45 && bearScore>bullScore*1.25) {
+  if (bearScore>=75 && bearScore>bullScore*2.0 && bearGroups>=3) {
     return {
       action:"SELL",
-      confidence: Math.min(97, Math.round(55+(bearScore/total)*42)),
+      confidence: Math.min(97, Math.round(62+(bearScore/total)*35)),
       reasons: bearR.slice(0,7),
       meta
     };
@@ -673,7 +712,7 @@ function generateSignal(closes, highs, lows, opens=null, volumes=null) {
   return {
     action:"HOLD",
     confidence: Math.max(0, Math.round(Math.abs(bullScore-bearScore)/total*25)),
-    reasons: ["No strong confluence", ...(bullScore>bearScore?bullR:bearR).slice(0,2)],
+    reasons: ["Waiting for high-conviction setup", ...(bullScore>bearScore?bullR:bearR).slice(0,2)],
     meta
   };
 }
@@ -1076,10 +1115,10 @@ export default function App() {
     stopLoss:  "2",       // fallback % if ATR unavailable
     takeProfit:"4",
     interval:  "15m",
-    minConfidence: "62",
+    minConfidence: "70",
     useAtrSl:  true,      // use ATR-based SL/TP when available
     trailingPct: "1.5",   // trailing stop % (0 = disabled)
-    maxPositions: "20",   // hard cap on concurrent positions
+    maxPositions: "4",    // hard cap on concurrent positions — focused, not spread thin
     totalBudget:  "1000",  // max USDT to deploy across ALL open positions
     numCoins:     "20",   // auto-derived: floor(totalBudget / amount)
   });
@@ -1096,7 +1135,7 @@ export default function App() {
   const [liveTradeAmt,  setLiveTradeAmt]  = useState("");    // per-coin amount (auto-computed)
   const [liveTotalBudget,setLiveTotalBudget]=useState("1000"); // total USDT cap for this session
   const [livePerTradeAmt,setLivePerTradeAmt]=useState("50");  // USDT per individual position
-  const [liveNumCoins,  setLiveNumCoins]  = useState("20");  // auto-derived: floor(totalBudget/perTrade)
+  const [liveNumCoins,  setLiveNumCoins]  = useState("4");   // auto-derived: floor(totalBudget/perTrade)
   const [stopBalance,   setStopBalance]   = useState("");    // stop bot if USDT drops below this
   const [wdForm,        setWdForm]        = useState({ coin:"USDT", network:"BSC", address:"", amount:"" });
   const [wdStatus,      setWdStatus]      = useState(null);  // { type, msg }
@@ -1124,6 +1163,7 @@ export default function App() {
   const userStoppedRef = useRef(false);       // true = user manually stopped → bot must NOT re-open positions
   const closingPositionsRef = useRef(new Set()); // close-guard: prevents double-sell race between monitor & stop handler
   const obCacheRef     = useRef({});          // { [symbol]: {bids,asks,bidVol,askVol,bias,ts} }
+  const klineCacheTs   = useRef({});          // { [symbol]: timestamp } — kline freshness tracker
   const scanBatchRef   = useRef(0);           // rotating batch index for pair scanning          // { [symbol]: {bids,asks,bidVol,askVol,bias,ts} }
   const [btResult,     setBtResult]     = useState(null);
   const [btRunning,    setBtRunning]    = useState(false);
@@ -1324,6 +1364,22 @@ export default function App() {
     }
     const ex = creds?.exchange||"bybit";
     const {apiKey:k,apiSecret:s,passphrase:p} = creds||{};
+
+    // ── Kline cache: skip fetch if data is fresh (< half the candle interval) ──
+    // On 15m candles, don't re-fetch more than once every 7.5 minutes
+    // This is the biggest data saver — 150 candles × 10 symbols every minute is huge
+    const intervalMs = { "1m":60000,"3m":180000,"5m":300000,"15m":900000,"30m":1800000,
+                         "1h":3600000,"4h":14400000,"1d":86400000 };
+    const halfInterval = (intervalMs[cfg.interval]||900000) / 2;
+    const klineTs = klineCacheTs.current?.[symbol] || 0;
+    if (Date.now() - klineTs < halfInterval && klines[symbol]?.closes?.length >= 60) {
+      // Cache hit — re-run signal on existing data without fetching
+      const cached = klines[symbol];
+      const sig = generateSignal(cached.closes, cached.highs, cached.lows, cached.opens, cached.volumes);
+      setSignals(prev=>({...prev,[symbol]:sig}));
+      return sig;
+    }
+
     let rawData=null;
     try {
       if (ex==="binance") {
@@ -1350,6 +1406,7 @@ export default function App() {
         const sig = generateSignal(closes,highs,lows,opens,volumes);
         setKlines(prev=>({...prev,[symbol]:{closes,highs,lows,opens,volumes}}));
         setSignals(prev=>({...prev,[symbol]:sig}));
+        klineCacheTs.current[symbol] = Date.now();  // stamp cache time
         return sig;
       } else if (ex==="okx") {
         const instId = toExSymbol(symbol,"okx");
@@ -1436,8 +1493,13 @@ export default function App() {
           } catch(_) { if (attempt < 1) await new Promise(r=>setTimeout(r,1200)); }
         }
         if (map) {
-          priceRef.current=map; setPrices(map);
+          // Keep full map in ref for valid-symbol checks, but only expose traded pairs to state
+          // This prevents re-rendering the whole UI for 400+ irrelevant tickers
+          priceRef.current=map;
           if (!validSymbolsRef.current) validSymbolsRef.current = new Set(Object.keys(map));
+          const filteredMap = {};
+          TOP_PAIRS.forEach(sym => { if (map[sym]) filteredMap[sym] = map[sym]; });
+          setPrices(filteredMap);
         }
         else addLog("Market","Price fetch failed [bybit] — using cached prices","warn");
       } else if (ex==="okx") {
@@ -1965,7 +2027,8 @@ Respond in JSON only: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","short_reason":"ma
     }
 
     let holdCount = 0;
-    let openedThisTick = 0; // only open 1 new position per tick to prevent balance drain
+    let openedThisTick = 0;
+    const MAX_OPENS_PER_TICK = 2; // max 2 new positions per tick — prevents blasting all budget at once
     for (const symbol of batchPairs) {
       if (!isDemo && validSymbolsRef.current && !validSymbolsRef.current.has(symbol)) continue;
       const price=priceRef.current[symbol];
@@ -1976,7 +2039,7 @@ Respond in JSON only: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","short_reason":"ma
         holdCount++;
         continue;
       }
-      const minConf=parseFloat(cfg.minConfidence)||62;
+      const minConf=parseFloat(cfg.minConfidence)||70;
       if (sig.confidence<minConf) {
         holdCount++;
         continue;
@@ -2092,10 +2155,14 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
 
       /* Open new position */
       if (!existing||(existing&&existing.side!==sig.action)) {
-        // ── Allow multiple opens per tick — fill all available budget slots ──
+        // ── Cap new opens per tick to prevent blasting entire budget in one scan ──
+        if (openedThisTick >= MAX_OPENS_PER_TICK) {
+          addLog("Bot",`Max ${MAX_OPENS_PER_TICK} new positions this tick — resuming next scan`,"info");
+          break;
+        }
         const currentTotal = posRef.current.length + openedThisTick;
         if (currentTotal >= maxPos) {
-          addLog("Bot",`All ${maxPos} slots filled this tick — done scanning`,"info");
+          addLog("Bot",`All ${maxPos} slots filled — waiting for exits`,"info");
           break;
         }
         // ── Budget guard: deployed + this trade must not exceed totalBudget ──
@@ -2529,8 +2596,8 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
   /* ── Price + SL/TP monitor loop ── */
   useEffect(()=>{
     if (!creds&&!isDemo&&!paperMode) return;
-    const iv1=setInterval(fetchPrices,5000);
-    const iv2=setInterval(monitorPositions,6000);
+    const iv1=setInterval(fetchPrices,15000);       // 15s instead of 5s — prices don't change that fast
+    const iv2=setInterval(monitorPositions,8000);   // 8s monitor check is fine
     return ()=>{ clearInterval(iv1); clearInterval(iv2); };
   },[creds,isDemo,paperMode,fetchPrices,monitorPositions]);
 
