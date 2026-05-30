@@ -1164,6 +1164,7 @@ export default function App() {
   const closingPositionsRef = useRef(new Set()); // close-guard: prevents double-sell race between monitor & stop handler
   const obCacheRef     = useRef({});          // { [symbol]: {bids,asks,bidVol,askVol,bias,ts} }
   const klineCacheTs   = useRef({});          // { [symbol]: timestamp } — kline freshness tracker
+  const klinesRef      = useRef({});          // mirrors klines state — always current inside callbacks
   const scanBatchRef   = useRef(0);           // rotating batch index for pair scanning          // { [symbol]: {bids,asks,bidVol,askVol,bias,ts} }
   const [btResult,     setBtResult]     = useState(null);
   const [btRunning,    setBtRunning]    = useState(false);
@@ -1180,6 +1181,7 @@ export default function App() {
   useEffect(()=>{ balancesRef.current=balances; },[balances]);
   useEffect(()=>{ botRunningRef.current=botRunning; },[botRunning]);
   useEffect(()=>{ stopBalanceRef.current=parseFloat(stopBalance)||0; },[stopBalance]);
+  useEffect(()=>{ klinesRef.current=klines; },[klines]);  // keep ref current so cache check inside callbacks is never stale
   useEffect(()=>{ if(logRef.current) logRef.current.scrollTop=logRef.current.scrollHeight; },[log]);
   // Reset symbol cache whenever the connected exchange changes
   useEffect(()=>{ validSymbolsRef.current = null; instrInfoRef.current = {}; instrInfoLoadedRef.current = false; },[creds]);
@@ -1372,9 +1374,9 @@ export default function App() {
                          "1h":3600000,"4h":14400000,"1d":86400000 };
     const halfInterval = (intervalMs[cfg.interval]||900000) / 2;
     const klineTs = klineCacheTs.current?.[symbol] || 0;
-    if (Date.now() - klineTs < halfInterval && klines[symbol]?.closes?.length >= 60) {
+    if (Date.now() - klineTs < halfInterval && klinesRef.current[symbol]?.closes?.length >= 60) {
       // Cache hit — re-run signal on existing data without fetching
-      const cached = klines[symbol];
+      const cached = klinesRef.current[symbol];
       const sig = generateSignal(cached.closes, cached.highs, cached.lows, cached.opens, cached.volumes);
       setSignals(prev=>({...prev,[symbol]:sig}));
       return sig;
@@ -1393,6 +1395,7 @@ export default function App() {
         const sig = generateSignal(closes,highs,lows,opens,volumes);
         setKlines(prev=>({...prev,[symbol]:{closes,highs,lows,opens,volumes}}));
         setSignals(prev=>({...prev,[symbol]:sig}));
+        klineCacheTs.current[symbol] = Date.now();
         return sig;
       } else if (ex==="bybit") {
         const r = await bbPublic("/v5/market/kline",{category:"spot",symbol,interval:IV_BYBIT[cfg.interval]||"15",limit:"150"});
@@ -1421,6 +1424,7 @@ export default function App() {
         const sig = generateSignal(closes,highs,lows,opens,volumes);
         setKlines(prev=>({...prev,[symbol]:{closes,highs,lows,opens,volumes}}));
         setSignals(prev=>({...prev,[symbol]:sig}));
+        klineCacheTs.current[symbol] = Date.now();
         return sig;
       } else if (ex==="kucoin") {
         const instId = toExSymbol(symbol,"kucoin");
@@ -1433,10 +1437,11 @@ export default function App() {
         const highs  = rev.map(r=>parseFloat(r[3]));
         const lows   = rev.map(r=>parseFloat(r[4]));
         const volumes= rev.map(r=>parseFloat(r[5]));
-        const sig = generateSignal(closes,highs,lows,opens,volumes);
+        const sig2 = generateSignal(closes,highs,lows,opens,volumes);
         setKlines(prev=>({...prev,[symbol]:{closes,highs,lows,opens,volumes}}));
-        setSignals(prev=>({...prev,[symbol]:sig}));
-        return sig;
+        setSignals(prev=>({...prev,[symbol]:sig2}));
+        klineCacheTs.current[symbol] = Date.now();
+        return sig2;
       } else {
         // Coinbase — fallback to Bybit public data for TA (Coinbase kline API needs OAuth2 for Advanced)
         const r = await bbPublic("/v5/market/kline",{category:"spot",symbol,interval:IV_BYBIT[cfg.interval]||"15",limit:"150"});
@@ -1446,10 +1451,11 @@ export default function App() {
         const lows   = rows.map(r=>parseFloat(r[3]));
         const closes = rows.map(r=>parseFloat(r[4]));
         const volumes= rows.map(r=>parseFloat(r[5]));
-        const sig = generateSignal(closes,highs,lows,opens,volumes);
+        const sig3 = generateSignal(closes,highs,lows,opens,volumes);
         setKlines(prev=>({...prev,[symbol]:{closes,highs,lows,opens,volumes}}));
-        setSignals(prev=>({...prev,[symbol]:sig}));
-        return sig;
+        setSignals(prev=>({...prev,[symbol]:sig3}));
+        klineCacheTs.current[symbol] = Date.now();
+        return sig3;
       }
     } catch(e) {
       addLog("TA",`Kline fetch failed [${ex}] ${symbol}: ${e.message}`,"error");
@@ -1481,45 +1487,27 @@ export default function App() {
         priceRef.current=map; setPrices(map);
         if (!validSymbolsRef.current) validSymbolsRef.current = new Set(Object.keys(map));
       } else if (ex==="bybit") {
-        // DATA SAVER: fetch only TOP_PAIRS one-by-one in a single batch call using symbol filter.
-        // Bybit supports ?symbol=BTCUSDT per request — we batch into groups of 10 to stay
-        // well under rate limits while avoiding the 400+ ticker all-market response (~150 KB).
-        let map = {};
-        const CHUNK = 10;
-        for (let i = 0; i < TOP_PAIRS.length; i += CHUNK) {
-          const chunk = TOP_PAIRS.slice(i, i + CHUNK);
-          try {
-            // Bybit doesn't support multi-symbol in one call, but the linear tickers endpoint
-            // is tiny per symbol. Use the spot tickers with a symbol filter instead.
-            // Fallback: if individual calls fail, use the full list once.
-            await Promise.all(chunk.map(async sym => {
-              try {
-                const d = await bbPublic("/v5/market/tickers", { category:"spot", symbol:sym });
-                const t = d?.list?.[0];
-                if (t) map[sym] = parseFloat(t.lastPrice);
-              } catch(_) {}
-            }));
-          } catch(_) {}
-        }
-        if (Object.keys(map).length > 0) {
-          priceRef.current = { ...priceRef.current, ...map };
-          if (!validSymbolsRef.current) validSymbolsRef.current = new Set(TOP_PAIRS);
-          setPrices({ ...map });
-        } else {
-          // Fallback to full ticker list only if targeted fetch completely fails
+        // Retry up to 2 times — transient network errors are common
+        let map = null;
+        for (let attempt = 0; attempt < 2 && !map; attempt++) {
           try {
             const d = await bbPublic("/v5/market/tickers",{category:"spot"});
             if ((d.list||[]).length > 0) {
-              (d.list).forEach(t=>{ map[t.symbol]=parseFloat(t.lastPrice); });
-              priceRef.current=map;
-              if (!validSymbolsRef.current) validSymbolsRef.current = new Set(Object.keys(map));
-              const filteredMap = {};
-              TOP_PAIRS.forEach(sym => { if (map[sym]) filteredMap[sym] = map[sym]; });
-              setPrices(filteredMap);
+              map = {};
+              d.list.forEach(t=>{ map[t.symbol]=parseFloat(t.lastPrice); });
             }
-          } catch(_) {}
-          addLog("Market","Price fetch failed [bybit] — using cached prices","warn");
+          } catch(_) { if (attempt < 1) await new Promise(r=>setTimeout(r,1200)); }
         }
+        if (map) {
+          // Keep full map in ref for valid-symbol checks, but only expose traded pairs to state
+          // This prevents re-rendering the whole UI for 400+ irrelevant tickers
+          priceRef.current=map;
+          if (!validSymbolsRef.current) validSymbolsRef.current = new Set(Object.keys(map));
+          const filteredMap = {};
+          TOP_PAIRS.forEach(sym => { if (map[sym]) filteredMap[sym] = map[sym]; });
+          setPrices(filteredMap);
+        }
+        else addLog("Market","Price fetch failed [bybit] — using cached prices","warn");
       } else if (ex==="okx") {
         const data = await okxPublic("/api/v5/market/tickers",{instType:"SPOT"});
         const map={}; (data||[]).forEach(t=>{ map[normSymbol(t.instId)]=parseFloat(t.last); });
@@ -1545,7 +1533,7 @@ export default function App() {
 
   /* ── Fetch Order Book depth ── */
   const fetchOrderBook = useCallback(async(symbol)=>{
-    // 90s staleness cache — order book walls don't shift faster than a bot tick
+    // 30s staleness cache — avoid hitting API every bot tick for every signal
     const cached = obCacheRef.current[symbol];
     if (cached && Date.now() - cached.ts < 90000) {
       return {bids:cached.bids,asks:cached.asks,bidVol:cached.bidVol,askVol:cached.askVol,bias:cached.bias};
@@ -2605,21 +2593,18 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
   /* ── Periodic exchange balance refresh (live mode only) ── */
   useEffect(()=>{
     if (!creds || isDemo || paperMode) return;
-    // Fetch immediately on connect, then every 120 s — balance doesn't need sub-minute polling
+    // Fetch immediately on connect, then every 120 s — balance only matters after a trade
     fetchBalances();
     const iv = setInterval(fetchBalances, 120000);
     return () => clearInterval(iv);
   },[creds, isDemo, paperMode, fetchBalances]);
 
-  /* ── Pause all polling when screen is off / tab is hidden ── */
+  /* ── Pause all polling when screen is off / app is backgrounded ── */
   useEffect(()=>{
     const onVisibility = () => {
-      // When the user switches away or locks the phone, stop the bot tick and price loops.
-      // They restart automatically when the tab becomes visible again via the existing useEffects.
       if (document.hidden) {
         clearInterval(botRef.current);
       } else {
-        // Resumed — immediately re-fetch prices then restart the bot tick if it was running
         if (creds || isDemo || paperMode) fetchPrices();
         if (botRunningRef.current) {
           runBotTick();
@@ -2634,7 +2619,7 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
   /* ── Price + SL/TP monitor loop ── */
   useEffect(()=>{
     if (!creds&&!isDemo&&!paperMode) return;
-    const iv1=setInterval(fetchPrices,45000);       // 45s — sufficient for 15m-candle bot; saves ~3× mobile data
+    const iv1=setInterval(fetchPrices,60000);       // 60s — kline cache now handles intra-minute freshness
     const iv2=setInterval(monitorPositions,8000);   // 8s monitor check is fine
     return ()=>{ clearInterval(iv1); clearInterval(iv2); };
   },[creds,isDemo,paperMode,fetchPrices,monitorPositions]);
