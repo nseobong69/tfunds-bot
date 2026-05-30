@@ -1988,14 +1988,14 @@ Respond in JSON only: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","short_reason":"ma
         const book = await fetchOrderBook(symbol);
         if (book) {
           bookBias = book.bias;
-          // If bot wants to BUY but sell walls dominate by >20%, skip
-          if (sig.action==="BUY" && bookBias < -20) {
-            addLog("OrderBook",`${symbol} → BUY blocked — strong sell wall (bias ${bookBias.toFixed(1)}%)`,"warn");
+          // If bot wants to BUY but sell walls dominate by >35%, skip (loosened from 20%)
+          if (sig.action==="BUY" && bookBias < -35) {
+            addLog("OrderBook",`${symbol} → BUY blocked — extreme sell wall (bias ${bookBias.toFixed(1)}%)`,"warn");
             continue;
           }
-          // If bot wants to SELL but buy walls dominate by >20%, skip
-          if (sig.action==="SELL" && bookBias > 20) {
-            addLog("OrderBook",`${symbol} → SELL blocked — strong buy wall (bias ${bookBias.toFixed(1)}%)`,"warn");
+          // If bot wants to SELL but buy walls dominate by >35%, skip (loosened from 20%)
+          if (sig.action==="SELL" && bookBias > 35) {
+            addLog("OrderBook",`${symbol} → SELL blocked — extreme buy wall (bias ${bookBias.toFixed(1)}%)`,"warn");
             continue;
           }
           // OK — no log needed, reduces noise
@@ -2020,10 +2020,12 @@ Respond in JSON only: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","short_reason":"ma
         }
       }
 
-      // ── GATE 3: AI Review — ask Groq to confirm the signal ──
-      try {
-        const closes = klines[symbol]?.closes?.slice(-20).map(v=>v.toFixed(4)).join(", ")||"";
-        const prompt = `You are a crypto trading assistant. Analyze this signal for ${symbol}:
+      // ── AI Review — fire-and-forget background only, NEVER blocks trade ──
+      // AI is decorative/informational only; trade proceeds immediately without waiting
+      (async()=>{
+        try {
+          const closes = klines[symbol]?.closes?.slice(-20).map(v=>v.toFixed(4)).join(", ")||"";
+          const prompt = `You are a crypto trading assistant. Analyze this signal for ${symbol}:
 Action: ${sig.action} | Confidence: ${sig.confidence}% | Regime: ${sig.meta?.regime}
 RSI: ${sig.meta?.rsi?.toFixed(1)} | MACD: ${sig.meta?.macd?.toFixed(2)} | ADX: ${sig.meta?.adx?.toFixed(1)}
 Order book bias: ${bookBias.toFixed(1)}%
@@ -2031,42 +2033,32 @@ Recent closes (oldest→newest): ${closes}
 Reasons: ${sig.reasons?.join("; ")}
 
 Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","short_reason":"max 10 words","risk":"LOW"|"MED"|"HIGH"}`;
-
-        const resp = await fetch("https://api.groq.com/openai/v1/chat/completions",{
-          method:"POST",
-          headers:{"Content-Type":"application/json","Authorization":"Bearer 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"},
-          body:JSON.stringify({model:"llama-3.1-8b-instant",max_tokens:120,messages:[{role:"user",content:prompt}]})
-        });
-        const aiData = await resp.json();
-        const aiText = aiData.choices?.[0]?.message?.content||"";
-        let aiJson = {verdict:"CAUTION",short_reason:"AI parse error",risk:"MED"};
-        if (aiText) {
-          try {
-            // Strip markdown fences and any leading/trailing non-JSON characters
-            const clean = aiText.replace(/```json|```/g,"").trim();
-            const jsonStart = clean.indexOf("{");
-            const jsonEnd   = clean.lastIndexOf("}");
-            if (jsonStart !== -1 && jsonEnd !== -1) {
-              const parsed = JSON.parse(clean.slice(jsonStart, jsonEnd+1));
-              if (parsed.verdict) aiJson = parsed;
-            }
-          } catch(_) { /* keep default CAUTION */ }
-        }
-        // Normalise fields so they are never undefined
-        aiJson.verdict     = aiJson.verdict     || "CAUTION";
-        aiJson.short_reason= aiJson.short_reason|| "no reason";
-        aiJson.risk        = aiJson.risk        || "MED";
-        setAiSignals(prev=>({...prev,[symbol]:{...aiJson,ts:Date.now()}}));
-
-        if (aiJson.verdict==="REJECT") {
-          addLog("AI",`${symbol} → REJECTED by AI: ${aiJson.short_reason}`,"warn");
-          continue;
-        }
-        addLog("AI",`${symbol} → AI ${aiJson.verdict}: ${aiJson.short_reason} · Risk: ${aiJson.risk}`,"ok");
-      } catch(e) {
-        // AI failed — log but don't block the trade (non-fatal)
-        addLog("AI",`${symbol} AI check skipped (${e.message}) — proceeding`,"warn");
-      }
+          const resp = await fetch("https://api.groq.com/openai/v1/chat/completions",{
+            method:"POST",
+            headers:{"Content-Type":"application/json","Authorization":"Bearer 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"},
+            body:JSON.stringify({model:"llama-3.1-8b-instant",max_tokens:120,messages:[{role:"user",content:prompt}]})
+          });
+          const aiData = await resp.json();
+          const aiText = aiData.choices?.[0]?.message?.content||"";
+          let aiJson = {verdict:"CAUTION",short_reason:"AI parse error",risk:"MED"};
+          if (aiText) {
+            try {
+              const clean = aiText.replace(/```json|```/g,"").trim();
+              const jsonStart = clean.indexOf("{");
+              const jsonEnd   = clean.lastIndexOf("}");
+              if (jsonStart !== -1 && jsonEnd !== -1) {
+                const parsed = JSON.parse(clean.slice(jsonStart, jsonEnd+1));
+                if (parsed.verdict) aiJson = parsed;
+              }
+            } catch(_) {}
+          }
+          aiJson.verdict     = aiJson.verdict     || "CAUTION";
+          aiJson.short_reason= aiJson.short_reason|| "no reason";
+          aiJson.risk        = aiJson.risk        || "MED";
+          setAiSignals(prev=>({...prev,[symbol]:{...aiJson,ts:Date.now()}}));
+          addLog("AI",`${symbol} → AI ${aiJson.verdict}: ${aiJson.short_reason} · Risk: ${aiJson.risk}`,"ok");
+        } catch(e) { /* silent — AI is non-critical */ }
+      })();
 
       // ── All gates passed — execute trade ──
       const existing=posRef.current.find(p=>p.symbol===symbol);
@@ -2128,12 +2120,12 @@ Respond ONLY in JSON, no extra text: {"verdict":"CONFIRM"|"CAUTION"|"REJECT","sh
           break;
         }
 
-        // Only skip if balance can't even cover one trade
-        if (usdtBal * 0.98 < perTradeAmt) {
-          addLog("Bot",`Skipping ${symbol} — need $${perTradeAmt.toFixed(2)}/trade, have $${usdtBal.toFixed(2)} USDT`,"warn");
+        // Use Math.min to trade with available funds — only skip if truly insufficient
+        const safeAmt = Math.min(perTradeAmt, usdtBal * 0.98);
+        if (safeAmt < 0.1) {
+          addLog("Bot",`Skipping ${symbol} — insufficient USDT balance ($${usdtBal.toFixed(4)} available)`,"warn");
           continue;
         }
-        const safeAmt = perTradeAmt;
         const orderQty = +(safeAmt/price).toFixed(6);
         const TAKER_FEE = 0.001;
         const qty = +(orderQty * (1 - TAKER_FEE)).toFixed(6);
